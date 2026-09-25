@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Rust format & clippy
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: Desktop install & test
+        run: |
+          pnpm install
+          pnpm --filter @nalarvo/desktop test
+          pnpm --filter @nalarvo/desktop lint
+          pnpm --filter @nalarvo/desktop format:check

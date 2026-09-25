@@ -1,0 +1,16 @@
+[package]
+name = "nalarvo-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nalarvo-local-api = { path = "../local-api" }
+axum.workspace = true
+clap = { workspace = true, features = ["env"] }
+hex.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

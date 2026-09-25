@@ -1,0 +1,11 @@
+{
+  "name": "nalarvo",
+  "private": true,
+  "workspaces": ["apps/desktop"],
+  "scripts": {
+    "build": "npm run build --workspace @nalarvo/desktop",
+    "test": "npm run test --workspace @nalarvo/desktop",
+    "lint": "npm run lint --workspace @nalarvo/desktop",
+    "format:check": "npm run format:check --workspace @nalarvo/desktop"
+  }
+}
