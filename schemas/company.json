@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Company",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string" },
+    "workspace_id": { "type": "string" },
+    "name": { "type": "string" },
+    "description": { "type": ["string", "null"] },
+    "status": {
+      "type": "string",
+      "enum": ["DRAFT", "ACTIVE", "PAUSED", "ARCHIVED"]
+    },
+    "row_version": { "type": "integer", "minimum": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  },
+  "required": [
+    "id",
+    "workspace_id",
+    "name",
+    "status",
+    "row_version",
+    "created_at",
+    "updated_at"
+  ],
+  "additionalProperties": false
+}

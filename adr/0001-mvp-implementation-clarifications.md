@@ -7,25 +7,13 @@
 
 ---
 
-## 1. Physical Tier-1 Schema Baseline & Migration Sequence
+## 1. Physical Tier-1 Schema Baseline & Migration Reconciliation
 
-* **Canonical Migration Baseline:** The authoritative physical MVP sequencing follows the canonical 14-migration sequence defined in `Nalarvo — MVP Scope & Implementation Plan.md`:
-  * `0001_identity_workspace`
-  * `0002_governance_policy`
-  * `0003_work_tracking`
-  * `0004_agent_configuration`
-  * `0005_runtime_execution`
-  * `0006_action_receipts`
-  * `0007_budget_reservations`
-  * `0008_security_audit`
-  * `0009_evaluations_acceptance` (durable evaluation records & acceptance decisions prior to M7 completion)
-  * `0010_knowledge_memory`
-  * `0011_capabilities_tools`
-  * `0012_system_projections`
-  * `0013_checkpointing_recovery`
-  * `0014_governance_v2_extensions`
-* **Semantic Authority:** The Logical Data Model remains the semantic definition of what concepts exist. Before M1 expansion, every Tier-1 entity must be explicitly classified as `TABLE NOW`, `TABLE LATER IN MVP`, `EMBEDDED / VALUE OBJECT`, `DERIVED / PROJECTION`, or `EXPLICITLY DEFERRED`.
-* **Resource Reservations & Budgeting:** Minimum durable budget tracking and atomic hard-budget reservation semantics are mapped as `TABLE NOW` / `EMBEDDED` in early milestones (M3/M4/M5). Complex multi-agent optimization and speculative capacity booking are `EXPLICITLY DEFERRED`.
+* **Canonical Source Sequence:** `Nalarvo — MVP Scope & Implementation Plan.md` §31 retains its original 14 migration names and order: `0001_identity_workspace`, `0002_platform_resources`, `0003_company_workforce`, `0004_project_team`, `0005_work`, `0006_governance`, `0007_execution`, `0008_runtime_durability`, `0009_events_observability`, `0010_artifacts`, `0011_information`, `0012_information_fts`, `0013_capability_extension`, `0014_projections`. This source history is not rewritten.
+* **MVP RECONCILED PHYSICAL MIGRATION PLAN:** The engineering mapping in `analysis/TIER1_SCHEMA_CHECKLIST.md` may introduce durable Core primitives earlier and split source groups into incremental physical migrations. It is a derived implementation plan, not the canonical source sequence. The checklist maps canonical source concept → reconciled physical migration → first required milestone; moving a table never removes its semantics.
+* **Semantic Authority:** The Logical Data Model remains the semantic definition of concepts. Every Tier-1 concept is explicitly classified by physical strategy and first-required milestone; M1 creates only the minimal identity, Company, idempotency, event, outbox, and inbox slice.
+* **Resource Reservations & Budgeting:** Minimum durable resource reservations and atomic hard-budget enforcement are required before budgeted execution. Advanced reservation optimization and speculative capacity booking are deferred.
+* **M7 Gate:** `evaluation_records` and `acceptance_decisions` are durable before M7 completion and survive restart/replay. `Run SUCCEEDED ≠ WorkItem COMPLETED`.
 
 ---
 

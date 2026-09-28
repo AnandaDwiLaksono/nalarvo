@@ -8,9 +8,15 @@ license.workspace = true
 [dependencies]
 nalarvo-contracts = { path = "../contracts" }
 reqwest.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+nalarvo-application = { path = "../application" }
+nalarvo-domain = { path = "../domain" }
+nalarvo-persistence = { path = "../persistence" }
 nalarvo-local-api = { path = "../local-api" }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 axum.workspace = true
+futures-util.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

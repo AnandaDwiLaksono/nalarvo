@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SseEventEnvelope",
+  "type": "object",
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "type": "string" },
+    "schema_version": { "type": "integer" },
+    "company_id": { "type": "string" },
+    "principal": {
+      "type": "object",
+      "properties": {
+        "principal_type": { "type": "string", "enum": ["USER", "AGENT", "SYSTEM"] },
+        "principal_id": { "type": "string" }
+      },
+      "required": ["principal_type", "principal_id"]
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "scope_type": { "type": "string", "enum": ["WORKSPACE", "COMPANY"] },
+        "scope_id": { "type": "string" }
+      },
+      "required": ["scope_type", "scope_id"]
+    },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "payload": { "type": "object" }
+  },
+  "required": ["event_id", "event_type", "schema_version", "company_id", "principal", "scope", "occurred_at", "payload"],
+  "additionalProperties": false
+}

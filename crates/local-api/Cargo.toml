@@ -7,10 +7,17 @@ license.workspace = true
 
 [dependencies]
 nalarvo-contracts = { path = "../contracts" }
-axum.workspace = true
+nalarvo-domain = { path = "../domain" }
+nalarvo-application = { path = "../application" }
+axum = { workspace = true, features = ["macros"] }
+futures-util.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
-tokio.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }
 tower = { workspace = true, features = ["util"] }

@@ -1,3 +1,4 @@
+use nalarvo_contracts::{CompanyDto, CompanyListResponse, CreateCompanyRequest, HealthResponse};
 use std::{
     io::{BufRead, BufReader},
     process::{Child, Command, Stdio},
@@ -10,8 +11,31 @@ use std::{
 async fn core_health(
     token: tauri::State<'_, String>,
     daemon_url: tauri::State<'_, String>,
-) -> Result<nalarvo_contracts::HealthResponse, String> {
+) -> Result<HealthResponse, String> {
     nalarvo_client::health(&daemon_url, &token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_companies(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    workspace_id: String,
+) -> Result<CompanyListResponse, String> {
+    nalarvo_client::list_companies(&daemon_url, &token, &workspace_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_company(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    workspace_id: String,
+    req: CreateCompanyRequest,
+) -> Result<CompanyDto, String> {
+    nalarvo_client::create_company(&daemon_url, &token, &workspace_id, &req, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -86,7 +110,11 @@ pub fn run() {
     };
 
     builder
-        .invoke_handler(tauri::generate_handler![core_health])
+        .invoke_handler(tauri::generate_handler![
+            core_health,
+            core_list_companies,
+            core_create_company
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Nalarvo desktop");
 }

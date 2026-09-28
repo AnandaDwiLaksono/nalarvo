@@ -1,4 +1,5 @@
 use clap::Parser;
+use nalarvo_application::{ApplicationContext, start_outbox_dispatcher};
 use rand::Rng;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -12,6 +13,12 @@ struct Args {
     token: Option<String>,
     #[arg(long)]
     emit_token: bool,
+    #[arg(
+        long,
+        env = "NALARVO_DB_URL",
+        default_value = "sqlite://data.sqlite?mode=rwc"
+    )]
+    db_url: String,
 }
 
 #[tokio::main]
@@ -27,12 +34,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let token = args.token.unwrap_or_else(new_token);
+
+    // Initialize application context and run migrations
+    let app_ctx = ApplicationContext::init(&args.db_url).await?;
+
+    // Start background outbox dispatcher
+    let _dispatcher = start_outbox_dispatcher(app_ctx.clone(), 500, "daemon-dispatcher".into());
+
     let listener = TcpListener::bind(args.bind).await?;
     if args.emit_token {
         println!("{token}");
     }
     tracing::info!(address = %listener.local_addr()?, "Nalarvo Core listening");
-    axum::serve(listener, nalarvo_local_api::router(Arc::<str>::from(token))).await?;
+
+    let router = nalarvo_local_api::router_with_app(Arc::<str>::from(token), Some(app_ctx));
+    axum::serve(listener, router).await?;
     Ok(())
 }
 

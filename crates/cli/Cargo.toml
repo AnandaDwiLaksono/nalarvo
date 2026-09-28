@@ -10,7 +10,8 @@ name = "nalarvo"
 path = "src/main.rs"
 
 [dependencies]
+nalarvo-contracts = { path = "../contracts" }
 nalarvo-client = { path = "../client" }
-clap = { workspace = true, features = ["env"] }
+clap = { workspace = true, features = ["env", "derive"] }
 tokio.workspace = true
 url.workspace = true
