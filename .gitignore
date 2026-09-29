@@ -8,17 +8,24 @@
 *.pfx
 *.crt
 *.cer
-credentials*
-secrets*
-secret*
-token*
-tokens*
-api-key*
-api_key*
-auth-token*
-auth_token*
+# Local secret-bearing exports, not source files such as secret_store.rs.
+credentials.json
+secrets.json
+secret.json
+token.json
+tokens.json
+api-key.txt
+api_key.txt
+auth-token.txt
+auth_token.txt
+*.secret
+*.secrets
+*.credentials
+*.token
+*.tokens
 
 # Local databases and runtime state
+run_cargo.py
 *.db
 *.sqlite
 *.sqlite3

@@ -2324,9 +2324,11 @@ dependencies = [
 name = "nalarvo-application"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "nalarvo-domain",
  "nalarvo-persistence",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sqlx",
@@ -2342,9 +2344,11 @@ dependencies = [
 name = "nalarvo-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "nalarvo-client",
  "nalarvo-contracts",
+ "serde_json",
  "tokio",
  "url",
 ]
@@ -2361,6 +2365,7 @@ dependencies = [
  "nalarvo-local-api",
  "nalarvo-persistence",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -2426,10 +2431,13 @@ dependencies = [
  "nalarvo-domain",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-stream",
  "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2448,6 +2456,14 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "nalarvo-secret-store-windows"
+version = "0.1.0"
+dependencies = [
+ "nalarvo-application",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

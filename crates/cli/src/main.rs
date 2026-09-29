@@ -26,6 +26,10 @@ enum Commands {
     Health,
     /// Manage companies
     Company(CompanyArgs),
+    /// Manage providers
+    Provider(ProviderArgs),
+    /// Manage agents
+    Agent(AgentArgs),
 }
 
 #[derive(ClapArgs)]
@@ -57,6 +61,39 @@ enum CompanyCommands {
         workspace_id: String,
         #[arg(long)]
         idempotency_key: Option<String>,
+    },
+}
+
+#[derive(ClapArgs)]
+struct ProviderArgs {
+    #[command(subcommand)]
+    command: ProviderCommands,
+}
+
+#[derive(Subcommand)]
+enum ProviderCommands {
+    /// List providers
+    List,
+}
+
+#[derive(ClapArgs)]
+struct AgentArgs {
+    #[command(subcommand)]
+    command: AgentCommands,
+}
+
+#[derive(Subcommand)]
+enum AgentCommands {
+    /// List agents for a company
+    List {
+        #[arg(long)]
+        company: String,
+    },
+    /// Show details for an agent
+    Show {
+        id: String,
+        #[arg(long)]
+        company: Option<String>,
     },
 }
 
@@ -128,6 +165,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Name:        {}", c.name);
                 println!("Status:      {}", c.status);
                 println!("Version:     {}", c.row_version);
+            }
+        },
+        Commands::Provider(po) => match po.command {
+            ProviderCommands::List => {
+                let res = nalarvo_client::list_providers(&cli.daemon_url, &cli.token).await?;
+                if res.providers.is_empty() {
+                    println!("No providers found.");
+                } else {
+                    println!(
+                        "{:<38} {:<20} {:<12} {:<10} {:<12}",
+                        "ID", "NAME", "KIND", "STATUS", "HEALTH"
+                    );
+                    for p in res.providers {
+                        println!(
+                            "{:<38} {:<20} {:<12} {:<10} {:<12}",
+                            p.id, p.name, p.provider_kind, p.status, p.health
+                        );
+                    }
+                }
+            }
+        },
+        Commands::Agent(ao) => match ao.command {
+            AgentCommands::List { company } => {
+                let res =
+                    nalarvo_client::list_agents(&cli.daemon_url, &cli.token, &company).await?;
+                if res.agents.is_empty() {
+                    println!("No agents found for company {company}.");
+                } else {
+                    println!(
+                        "{:<38} {:<24} {:<10} {:<8}",
+                        "ID", "NAME", "STATUS", "CAPACITY"
+                    );
+                    for a in res.agents {
+                        println!(
+                            "{:<38} {:<24} {:<10} {:<8}",
+                            a.id, a.name, a.status, a.capacity
+                        );
+                    }
+                }
+            }
+            AgentCommands::Show { id, company } => {
+                let company_id = company.unwrap_or_default();
+                let a = nalarvo_client::get_agent(&cli.daemon_url, &cli.token, &company_id, &id)
+                    .await?;
+                println!("ID:          {}", a.id);
+                println!("Company:     {}", a.company_id);
+                println!("Name:        {}", a.name);
+                println!("Status:      {}", a.status);
+                println!("Capacity:    {}", a.capacity);
+                println!("Department:  {}", a.primary_department_id);
+                println!("Role:        {}", a.role_id);
+                println!("Version:     {}", a.row_version);
             }
         },
     }

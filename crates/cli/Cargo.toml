@@ -15,3 +15,7 @@ nalarvo-client = { path = "../client" }
 clap = { workspace = true, features = ["env", "derive"] }
 tokio.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+serde_json.workspace = true

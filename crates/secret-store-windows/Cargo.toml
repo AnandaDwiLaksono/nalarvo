@@ -1,0 +1,12 @@
+[package]
+name = "nalarvo-secret-store-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nalarvo-application = { path = "../application" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security_Credentials"] }

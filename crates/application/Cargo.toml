@@ -9,6 +9,7 @@ license.workspace = true
 nalarvo-domain = { path = "../domain" }
 nalarvo-persistence = { path = "../persistence" }
 chrono.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -19,4 +20,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 tempfile = "3"

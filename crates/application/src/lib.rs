@@ -16,6 +16,16 @@ use tokio::sync::broadcast;
 use tracing::error;
 use uuid::Uuid;
 
+pub mod m2;
+pub use nalarvo_persistence::{
+    AgentRecord, CredentialRefRecord, DepartmentRecord, ProviderConnectionRecord, RoleRecord,
+    WorkspaceRecord,
+};
+mod secret_store;
+pub use secret_store::{
+    CredentialRef, FakeSecretStore, SecretStore, SecretStoreError, SecretValue,
+};
+
 #[derive(Debug, Error)]
 pub enum ApplicationError {
     #[error("Domain error: {0}")]

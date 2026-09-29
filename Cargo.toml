@@ -3,6 +3,7 @@ members = [
     "crates/domain",
     "crates/persistence",
     "crates/application",
+    "crates/secret-store-windows",
     "crates/contracts",
     "crates/local-api",
     "crates/client",
@@ -39,4 +40,5 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+windows-sys = "0.61"
 uuid = { version = "1", features = ["v7", "serde"] }
