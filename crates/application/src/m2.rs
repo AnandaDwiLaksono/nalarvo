@@ -171,13 +171,29 @@ impl ApplicationContext {
             .endpoint
             .as_deref()
             .unwrap_or("https://api.openai.com/v1");
+        // Security: disable redirects — provider base_url is user-configured; following a
+        // 302/307 to an attacker-controlled Location could leak the Authorization header
+        // that future probes may carry. M2 health probe sends no credentials itself, but
+        // the policy must be locked before M3 adds authenticated probes.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ApplicationError::Validation(e.to_string()))?;
 
-        let health_status = match client.get(endpoint).send().await {
+        let mut request = client.get(endpoint);
+        if let Some(token) = provider
+            .credential_ref_id
+            .as_ref()
+            .and_then(|cred_id| self.secret_store.get(&CredentialRef::new(cred_id)).ok())
+            .and_then(|secret| std::str::from_utf8(secret.expose()).ok().map(String::from))
+        {
+            request = request.bearer_auth(token);
+        }
+
+        let health_status = match request.send().await {
             Ok(res) if res.status().is_success() => "HEALTHY",
+            // 3xx is explicitly treated as UNAVAILABLE — do not follow redirects
             _ => "UNAVAILABLE",
         };
 
@@ -607,10 +623,11 @@ impl ApplicationContext {
         let agent = persistence::get_agent_full(&self.pool, company_id, id)
             .await?
             .ok_or_else(|| ApplicationError::NotFound(id.into()))?;
-        // ponytail: current_allocations hardcoded to 0; real count comes from M3 allocations table
+        // ponytail: M2 interim derived rule: active_allocation_count = 0 because AgentAllocation does not exist yet.
+        // M3: availability calculation will consume real active AgentAllocations and capacity.
+        // Availability remains DERIVED state, never Agent lifecycle or persisted state.
         let availability = match agent.status.as_str() {
-            "ACTIVE" => "AVAILABLE",
-            "PAUSED" => "UNAVAILABLE",
+            "ACTIVE" if agent.capacity >= 1 => "AVAILABLE",
             _ => "UNAVAILABLE",
         };
         Ok(availability.into())
