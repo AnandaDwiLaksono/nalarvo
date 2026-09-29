@@ -2389,6 +2389,7 @@ dependencies = [
  "hex",
  "nalarvo-application",
  "nalarvo-local-api",
+ "nalarvo-secret-store-windows",
  "rand 0.9.5",
  "tokio",
  "tracing",

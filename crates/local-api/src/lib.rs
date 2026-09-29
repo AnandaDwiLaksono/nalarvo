@@ -489,6 +489,14 @@ fn map_app_error(err: ApplicationError) -> Response {
             )),
         )
             .into_response(),
+        ApplicationError::SecretStore(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorEnvelope::new(
+                error_codes::INTERNAL_ERROR,
+                "A secret store error occurred",
+            )),
+        )
+            .into_response(),
         ApplicationError::Domain(d) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorEnvelope::new(

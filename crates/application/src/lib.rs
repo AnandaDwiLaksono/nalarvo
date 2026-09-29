@@ -43,6 +43,9 @@ pub enum ApplicationError {
     #[error("Validation failed: {0}")]
     Validation(String),
 
+    #[error("Secret store operation failed")]
+    SecretStore(#[from] SecretStoreError),
+
     #[error("Resource not found: {0}")]
     NotFound(String),
 
@@ -155,28 +158,49 @@ pub struct ApplicationContext {
     pub pool: SqlitePool,
     pub event_broadcaster: broadcast::Sender<DomainEvent>,
     pub audit_sink: Arc<dyn AuditSink>,
+    secret_store: Arc<dyn SecretStore>,
 }
 
 impl ApplicationContext {
     pub fn new(pool: SqlitePool) -> Self {
-        let (event_broadcaster, _) = broadcast::channel(1024);
-        Self {
+        Self::with_ports(
             pool,
-            event_broadcaster,
-            audit_sink: Arc::new(TracingAuditSink),
-        }
+            Arc::new(TracingAuditSink),
+            Arc::new(FakeSecretStore::default()),
+        )
     }
 
     pub fn with_audit_sink(pool: SqlitePool, audit_sink: Arc<dyn AuditSink>) -> Self {
+        Self::with_ports(pool, audit_sink, Arc::new(FakeSecretStore::default()))
+    }
+
+    pub fn with_secret_store(mut self, secret_store: Arc<dyn SecretStore>) -> Self {
+        self.secret_store = secret_store;
+        self
+    }
+
+    pub fn with_ports(
+        pool: SqlitePool,
+        audit_sink: Arc<dyn AuditSink>,
+        secret_store: Arc<dyn SecretStore>,
+    ) -> Self {
         let (event_broadcaster, _) = broadcast::channel(1024);
         Self {
             pool,
             event_broadcaster,
             audit_sink,
+            secret_store,
         }
     }
 
     pub async fn init(database_url: &str) -> Result<Self, ApplicationError> {
+        Self::init_with_secret_store(database_url, Arc::new(FakeSecretStore::default())).await
+    }
+
+    pub async fn init_with_secret_store(
+        database_url: &str,
+        secret_store: Arc<dyn SecretStore>,
+    ) -> Result<Self, ApplicationError> {
         let pool = create_pool(database_url).await?;
         run_migrations(&pool).await?;
 
@@ -192,7 +216,11 @@ impl ApplicationContext {
         )
         .await?;
 
-        Ok(Self::new(pool))
+        Ok(Self::with_ports(
+            pool,
+            Arc::new(TracingAuditSink),
+            secret_store,
+        ))
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<DomainEvent> {

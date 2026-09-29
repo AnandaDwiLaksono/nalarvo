@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nalarvo-local-api = { path = "../local-api" }
 nalarvo-application = { path = "../application" }
+nalarvo-secret-store-windows = { path = "../secret-store-windows" }
 axum.workspace = true
 clap = { workspace = true, features = ["env"] }
 hex.workspace = true

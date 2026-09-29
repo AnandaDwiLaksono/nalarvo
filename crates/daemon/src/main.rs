@@ -1,5 +1,6 @@
 use clap::Parser;
 use nalarvo_application::{ApplicationContext, start_outbox_dispatcher};
+use nalarvo_secret_store_windows::WindowsCredentialStore;
 use rand::Rng;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -35,8 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let token = args.token.unwrap_or_else(new_token);
 
-    // Initialize application context and run migrations
-    let app_ctx = ApplicationContext::init(&args.db_url).await?;
+    // Initialize application context with Windows secret store and run migrations
+    let app_ctx =
+        ApplicationContext::init_with_secret_store(&args.db_url, Arc::new(WindowsCredentialStore))
+            .await?;
 
     // Start background outbox dispatcher
     let _dispatcher = start_outbox_dispatcher(app_ctx.clone(), 500, "daemon-dispatcher".into());

@@ -4,7 +4,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use nalarvo_application::{
-    ApplicationContext, CredentialRef, FakeSecretStore, InMemoryAuditSink, SecretStore, SecretValue,
+    ApplicationContext, CredentialRef, FakeSecretStore, InMemoryAuditSink, SecretStore,
 };
 use nalarvo_contracts::{CredentialRefDto, ProviderConnectionDto};
 use nalarvo_domain::WorkspaceId;
@@ -52,10 +52,14 @@ async fn test_secret_canary_exhaustive_zero_leak_proof() {
 
     let audit_sink = Arc::new(InMemoryAuditSink::new());
     let base_ctx = ApplicationContext::init(&db_url).await.unwrap();
-    let app_ctx = ApplicationContext::with_audit_sink(base_ctx.pool.clone(), audit_sink.clone());
+    let secret_store = Arc::new(FakeSecretStore::default());
+    let app_ctx = ApplicationContext::with_ports(
+        base_ctx.pool.clone(),
+        audit_sink.clone(),
+        secret_store.clone(),
+    );
 
     let workspace_id = WorkspaceId("0191e4b8-0002-7000-8000-000000000001".into());
-    let secret_store = Arc::new(FakeSecretStore::default());
 
     let synthetic_canary = "CANARY_SYNTHETIC_SECRET_987654321_DO_NOT_LOG";
     let token = "test-bearer-token";
@@ -82,14 +86,15 @@ async fn test_secret_canary_exhaustive_zero_leak_proof() {
         leak_count += 1;
     }
 
-    // Store in authorized SecretStore path
+    // Verify stored in authorized SecretStore path
     let cred_dto: CredentialRefDto = serde_json::from_slice(&body_bytes).unwrap();
-    secret_store
-        .put(
-            &CredentialRef::new(&cred_dto.id),
-            &SecretValue::new(synthetic_canary),
-        )
-        .unwrap();
+    assert_eq!(
+        secret_store
+            .get(&CredentialRef::new(&cred_dto.id))
+            .unwrap()
+            .expose(),
+        synthetic_canary.as_bytes()
+    );
 
     // Surface 2: Create Provider referencing credential
     let create_prov_req = Request::builder()

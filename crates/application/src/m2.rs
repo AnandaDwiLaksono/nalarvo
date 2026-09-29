@@ -1,4 +1,4 @@
-use crate::{ApplicationContext, ApplicationError};
+use crate::{ApplicationContext, ApplicationError, CredentialRef, SecretValue};
 use nalarvo_domain::{
     AuditRecord, CompanyId, DomainEvent, PrincipalRef, ScopeRef, UserId, WorkspaceId,
 };
@@ -39,12 +39,21 @@ impl ApplicationContext {
         &self,
         workspace_id: &WorkspaceId,
         name: &str,
-        _secret: &str,
+        secret: &str,
     ) -> Result<CredentialRefRecord, ApplicationError> {
         let id = Uuid::now_v7().to_string();
-        // ponytail: secret stored in fake locator only; real keychain write in Subphase B
         let locator = format!("secretstore://workspace/{}/{}", workspace_id.0, id);
-        persistence::create_credential_ref(&self.pool, workspace_id, &id, name, &locator).await?;
+        let credential_ref = CredentialRef::new(&id);
+        let secret_value = SecretValue::new(secret);
+
+        self.secret_store.put(&credential_ref, &secret_value)?;
+        if let Err(err) =
+            persistence::create_credential_ref(&self.pool, workspace_id, &id, name, &locator).await
+        {
+            let _ = self.secret_store.delete(&credential_ref);
+            return Err(err.into());
+        }
+
         persistence::get_credential_ref(&self.pool, workspace_id, &id)
             .await?
             .ok_or_else(|| ApplicationError::NotFound(id))

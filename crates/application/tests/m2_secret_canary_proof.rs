@@ -1,9 +1,51 @@
 use nalarvo_application::{
-    ApplicationContext, CredentialRef, FakeSecretStore, SecretStore, SecretValue,
+    ApplicationContext, CredentialRef, FakeSecretStore, SecretStore, SecretStoreError, SecretValue,
 };
 use nalarvo_domain::WorkspaceId;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+struct FailingSecretStore;
+
+impl SecretStore for FailingSecretStore {
+    fn get(&self, _: &CredentialRef) -> Result<SecretValue, SecretStoreError> {
+        Err(SecretStoreError::Backend)
+    }
+
+    fn put(&self, _: &CredentialRef, _: &SecretValue) -> Result<(), SecretStoreError> {
+        Err(SecretStoreError::Backend)
+    }
+
+    fn delete(&self, _: &CredentialRef) -> Result<(), SecretStoreError> {
+        Err(SecretStoreError::Backend)
+    }
+}
+
+#[tokio::test]
+async fn credential_submission_fails_closed_when_secret_store_write_fails() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("secret_store_failure.db");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let app_ctx = ApplicationContext::init(&db_url)
+        .await
+        .unwrap()
+        .with_secret_store(Arc::new(FailingSecretStore));
+    let workspace_id = WorkspaceId("0191e4b8-0002-7000-8000-000000000001".into());
+
+    assert!(
+        app_ctx
+            .submit_credential(&workspace_id, "Rejected", "synthetic-test-value")
+            .await
+            .is_err()
+    );
+    assert!(
+        app_ctx
+            .list_credentials(&workspace_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
 
 #[tokio::test]
 async fn test_secret_canary_absence_across_all_persisted_and_emitted_surfaces() {
@@ -14,17 +56,21 @@ async fn test_secret_canary_absence_across_all_persisted_and_emitted_surfaces() 
     let app_ctx = ApplicationContext::init(&db_url).await.unwrap();
     let workspace_id = WorkspaceId("0191e4b8-0002-7000-8000-000000000001".into());
     let secret_store = Arc::new(FakeSecretStore::default());
+    let app_ctx = app_ctx.with_secret_store(secret_store.clone());
 
     let canary_secret = "CANARY_SYNTHETIC_SECRET_987654321_DO_NOT_LOG";
 
-    // 1. Submit secret to SecretStore
+    // Submission must persist the secret through the configured SecretStore.
     let cred_ref = app_ctx
         .submit_credential(&workspace_id, "TestKey", canary_secret)
         .await
         .unwrap();
-    let _ = secret_store.put(
-        &CredentialRef::new(&cred_ref.id),
-        &SecretValue::new(canary_secret),
+    assert_eq!(
+        secret_store
+            .get(&CredentialRef::new(&cred_ref.id))
+            .unwrap()
+            .expose(),
+        canary_secret.as_bytes()
     );
 
     // 2. Create provider referencing credential
