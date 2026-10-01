@@ -623,12 +623,24 @@ impl ApplicationContext {
         let agent = persistence::get_agent_full(&self.pool, company_id, id)
             .await?
             .ok_or_else(|| ApplicationError::NotFound(id.into()))?;
-        // ponytail: M2 interim derived rule: active_allocation_count = 0 because AgentAllocation does not exist yet.
-        // M3: availability calculation will consume real active AgentAllocations and capacity.
-        // Availability remains DERIVED state, never Agent lifecycle or persisted state.
-        let availability = match agent.status.as_str() {
-            "ACTIVE" if agent.capacity >= 1 => "AVAILABLE",
-            _ => "UNAVAILABLE",
+
+        let row = sqlx::query(
+            "SELECT COUNT(*) FROM agent_allocations WHERE company_id = ? AND agent_id = ? AND status = 'ACTIVE'",
+        )
+        .bind(&company_id.0)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        let active_allocations: i64 = sqlx::Row::get(&row, 0);
+
+        let availability = if agent.status != "ACTIVE" {
+            "UNAVAILABLE"
+        } else if active_allocations == 0 {
+            "AVAILABLE"
+        } else if active_allocations < agent.capacity {
+            "PARTIALLY_ALLOCATED"
+        } else {
+            "FULLY_ALLOCATED"
         };
         Ok(availability.into())
     }

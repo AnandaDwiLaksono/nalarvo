@@ -45,7 +45,47 @@ type Agent = {
   availability?: string;
   row_version: number;
 };
-type Tab = "Departments" | "Roles" | "Agents";
+type Project = {
+  id: string;
+  company_id: string;
+  name: string;
+  description?: string | null;
+  working_root_path?: string | null;
+  working_root_bound_at?: string | null;
+  status: string;
+  row_version: number;
+  created_at?: string;
+  updated_at?: string;
+};
+type WorkItem = {
+  id: string;
+  company_id: string;
+  project_id: string;
+  objective_id?: string | null;
+  parent_work_item_id?: string | null;
+  title: string;
+  description?: string | null;
+  work_type: string;
+  status: string;
+  row_version: number;
+  created_at?: string;
+  updated_at?: string;
+};
+type WorkDependency = {
+  id: string;
+  depends_on_work_item_id: string;
+  dependency_type: string;
+};
+type WorkAssignment = {
+  id: string;
+  agent_id: string;
+  allocation_id: string;
+  status: string;
+  is_primary: boolean;
+  row_version: number;
+};
+type Tab = "Departments" | "Roles" | "Agents" | "Projects" | "Work";
+
 const DEFAULT_WORKSPACE_ID = "0191e4b8-0002-7000-8000-000000000001";
 
 export default function App() {
@@ -56,9 +96,17 @@ export default function App() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [workItems, setWorkItems] = useState<WorkItem[]>([]);
+  const [dependencies, setDependencies] = useState<WorkDependency[]>([]);
+  const [assignments, setAssignments] = useState<WorkAssignment[]>([]);
   const [selectedCompany, setSelectedCompany] = useState("");
   const [selectedAgent, setSelectedAgent] = useState("");
+  const [selectedProject, setSelectedProject] = useState("");
+  const [selectedWorkItem, setSelectedWorkItem] = useState("");
   const [tab, setTab] = useState<Tab>("Departments");
+  const [projectName, setProjectName] = useState("");
+  const [projectDescription, setProjectDescription] = useState("");
   const [companyName, setCompanyName] = useState("");
   const [providerName, setProviderName] = useState("");
   const [endpoint, setEndpoint] = useState("");
@@ -101,18 +149,76 @@ export default function App() {
       setDepartments([]);
       setRoles([]);
       setAgents([]);
+      setProjects([]);
+      setWorkItems([]);
       return;
     }
-    const [departmentList, roleList, agentList] = await Promise.all([
-      invoke<{ departments: Department[] }>("core_list_departments", {
-        companyId,
-      }),
-      invoke<{ roles: Role[] }>("core_list_roles", { companyId }),
-      invoke<{ agents: Agent[] }>("core_list_agents", { companyId }),
-    ]);
+    const [departmentList, roleList, agentList, projectList] =
+      await Promise.all([
+        invoke<{ departments: Department[] }>("core_list_departments", {
+          companyId,
+        }),
+        invoke<{ roles: Role[] }>("core_list_roles", { companyId }),
+        invoke<{ agents: Agent[] }>("core_list_agents", { companyId }),
+        invoke<{ projects: Project[] }>("core_list_projects", { companyId }),
+      ]);
     setDepartments(departmentList.departments);
     setRoles(roleList.roles);
     setAgents(agentList.agents);
+    setProjects(projectList.projects);
+    setSelectedProject((previous) =>
+      projectList.projects.some((project) => project.id === previous)
+        ? previous
+        : (projectList.projects[0]?.id ?? ""),
+    );
+  };
+
+  const loadWorkItems = async (companyId: string, projectId: string) => {
+    if (!companyId || !projectId) {
+      setWorkItems([]);
+      setDependencies([]);
+      setAssignments([]);
+      return;
+    }
+    const result = await invoke<{ work_items: WorkItem[] }>(
+      "core_list_work_items",
+      {
+        companyId,
+        projectId,
+      },
+    );
+    setWorkItems(result.work_items);
+    setSelectedWorkItem((previous) =>
+      result.work_items.some((item) => item.id === previous)
+        ? previous
+        : (result.work_items[0]?.id ?? ""),
+    );
+  };
+
+  const loadWorkDetails = async (
+    companyId: string,
+    projectId: string,
+    workId: string,
+  ) => {
+    if (!companyId || !projectId || !workId) {
+      setDependencies([]);
+      setAssignments([]);
+      return;
+    }
+    const [depRes, assignRes] = await Promise.all([
+      invoke<{ dependencies: WorkDependency[] }>("core_list_dependencies", {
+        companyId,
+        projectId,
+        workId,
+      }),
+      invoke<{ assignments: WorkAssignment[] }>("core_list_assignments", {
+        companyId,
+        projectId,
+        workId,
+      }),
+    ]);
+    setDependencies(depRes.dependencies);
+    setAssignments(assignRes.assignments);
   };
 
   useEffect(() => {
@@ -134,10 +240,29 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedCompany) return;
-    void loadWorkforce(selectedCompany).catch(() => {
+    void loadWorkforce(selectedCompany).catch((cause) => {
+      console.error("Workforce could not be loaded.", cause);
       setError("Workforce could not be loaded.");
     });
   }, [selectedCompany]);
+
+  useEffect(() => {
+    if (!selectedCompany || !selectedProject) return;
+    void loadWorkItems(selectedCompany, selectedProject).catch(() => {
+      setError("Work could not be loaded.");
+    });
+  }, [selectedCompany, selectedProject]);
+
+  useEffect(() => {
+    if (!selectedCompany || !selectedProject || !selectedWorkItem) return;
+    void loadWorkDetails(
+      selectedCompany,
+      selectedProject,
+      selectedWorkItem,
+    ).catch(() => {
+      setError("Work details could not be loaded.");
+    });
+  }, [selectedCompany, selectedProject, selectedWorkItem]);
 
   const mutate = async (work: () => Promise<void>) => {
     setBusy(true);
@@ -156,6 +281,10 @@ export default function App() {
     (company) => company.id === selectedCompany,
   );
   const activeAgent = agents.find((agent) => agent.id === selectedAgent);
+  const activeProject = projects.find(
+    (project) => project.id === selectedProject,
+  );
+  const activeWorkItem = workItems.find((item) => item.id === selectedWorkItem);
 
   return (
     <main>
@@ -410,7 +539,15 @@ export default function App() {
             <section aria-labelledby="workforce-title">
               <h2 id="workforce-title">Workforce · {activeCompany.name}</h2>
               <nav aria-label="Workforce views">
-                {(["Departments", "Roles", "Agents"] as const).map((view) => (
+                {(
+                  [
+                    "Departments",
+                    "Roles",
+                    "Agents",
+                    "Projects",
+                    "Work",
+                  ] as const
+                ).map((view) => (
                   <button
                     key={view}
                     type="button"
@@ -624,6 +761,370 @@ export default function App() {
                     </button>
                   </form>
                 </>
+              )}
+              {tab === "Projects" && activeCompany && (
+                <section aria-labelledby="projects-title">
+                  <h2 id="projects-title">Projects · {activeCompany.name}</h2>
+                  <ul>
+                    {projects.map((project) => (
+                      <li key={project.id}>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedProject(project.id)}
+                        >
+                          {project.name}
+                        </button>
+                        {" · "}
+                        {project.status}
+                      </li>
+                    ))}
+                  </ul>
+                  {activeProject && (
+                    <article aria-label="Project detail">
+                      <h3>{activeProject.name}</h3>
+                      <p>
+                        {activeProject.status} · version{" "}
+                        {activeProject.row_version}
+                      </p>
+                      {activeProject.description && (
+                        <p>{activeProject.description}</p>
+                      )}
+                      {activeProject.status === "DRAFT" && (
+                        <button
+                          disabled={busy}
+                          onClick={() =>
+                            void mutate(async () => {
+                              await invoke("core_activate_project", {
+                                companyId: activeCompany.id,
+                                projectId: activeProject.id,
+                                expectedVersion: activeProject.row_version,
+                              });
+                              await loadWorkforce(activeCompany.id);
+                            })
+                          }
+                        >
+                          Activate Project
+                        </button>
+                      )}
+                      <p>
+                        Working Root:{" "}
+                        {activeProject.working_root_path || "None"}
+                      </p>
+                      {activeProject.working_root_path ? (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            void mutate(async () => {
+                              await invoke("core_unbind_project_working_root", {
+                                companyId: activeCompany.id,
+                                projectId: activeProject.id,
+                                req: {
+                                  expected_version: activeProject.row_version,
+                                },
+                              });
+                              await loadWorkforce(activeCompany.id);
+                            })
+                          }
+                        >
+                          Unbind Working Root
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            void mutate(async () => {
+                              const path = window.prompt(
+                                "Enter absolute directory path:",
+                              );
+                              if (!path) return;
+                              await invoke("core_bind_project_working_root", {
+                                companyId: activeCompany.id,
+                                projectId: activeProject.id,
+                                req: {
+                                  path,
+                                  expected_version: activeProject.row_version,
+                                },
+                              });
+                              await loadWorkforce(activeCompany.id);
+                            })
+                          }
+                        >
+                          Bind Working Root
+                        </button>
+                      )}
+                    </article>
+                  )}
+                  <form
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void mutate(async () => {
+                        await invoke("core_create_project", {
+                          companyId: activeCompany.id,
+                          req: {
+                            name: projectName.trim(),
+                            description: projectDescription.trim() || null,
+                          },
+                        });
+                        setProjectName("");
+                        setProjectDescription("");
+                        await loadWorkforce(activeCompany.id);
+                      });
+                    }}
+                  >
+                    <label>
+                      Project name{" "}
+                      <input
+                        required
+                        value={projectName}
+                        onChange={(event) => setProjectName(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      Description{" "}
+                      <textarea
+                        value={projectDescription}
+                        onChange={(event) =>
+                          setProjectDescription(event.target.value)
+                        }
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      disabled={busy || !projectName.trim()}
+                    >
+                      Create Project
+                    </button>
+                  </form>
+                </section>
+              )}
+              {tab === "Work" && activeCompany && (
+                <section aria-labelledby="work-title">
+                  <h2 id="work-title">Work · {activeCompany.name}</h2>
+                  <label>
+                    Project{" "}
+                    <select
+                      value={selectedProject}
+                      onChange={(event) =>
+                        setSelectedProject(event.target.value)
+                      }
+                    >
+                      {projects.map((project) => (
+                        <option key={project.id} value={project.id}>
+                          {project.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <ul>
+                    {workItems.map((item) => (
+                      <li key={item.id}>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedWorkItem(item.id)}
+                        >
+                          {item.title}
+                        </button>
+                        {" · "}
+                        {item.status} · {item.work_type}
+                      </li>
+                    ))}
+                  </ul>
+                  {activeProject && activeWorkItem && (
+                    <article aria-label="Work detail">
+                      <h3>{activeWorkItem.title}</h3>
+                      <p>Status: {activeWorkItem.status}</p>
+                      <p>Type: {activeWorkItem.work_type}</p>
+                      {activeWorkItem.description && (
+                        <p>Description: {activeWorkItem.description}</p>
+                      )}
+                      <div>
+                        <h4>Work Lifecycle</h4>
+                        {activeWorkItem.status === "BACKLOG" && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              void mutate(async () => {
+                                await invoke("core_work_lifecycle", {
+                                  companyId: activeCompany.id,
+                                  projectId: activeProject.id,
+                                  workId: activeWorkItem.id,
+                                  action: "ready",
+                                  expectedVersion: activeWorkItem.row_version,
+                                });
+                                await loadWorkItems(
+                                  activeCompany.id,
+                                  activeProject.id,
+                                );
+                              })
+                            }
+                          >
+                            Mark Ready
+                          </button>
+                        )}
+                        {activeWorkItem.status === "READY" && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              void mutate(async () => {
+                                await invoke("core_work_lifecycle", {
+                                  companyId: activeCompany.id,
+                                  projectId: activeProject.id,
+                                  workId: activeWorkItem.id,
+                                  action: "start",
+                                  expectedVersion: activeWorkItem.row_version,
+                                });
+                                await loadWorkItems(
+                                  activeCompany.id,
+                                  activeProject.id,
+                                );
+                              })
+                            }
+                          >
+                            Start Work
+                          </button>
+                        )}
+                        {activeWorkItem.status === "IN_PROGRESS" && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() =>
+                                void mutate(async () => {
+                                  await invoke("core_work_lifecycle", {
+                                    companyId: activeCompany.id,
+                                    projectId: activeProject.id,
+                                    workId: activeWorkItem.id,
+                                    action: "complete",
+                                    expectedVersion: activeWorkItem.row_version,
+                                  });
+                                  await loadWorkItems(
+                                    activeCompany.id,
+                                    activeProject.id,
+                                  );
+                                })
+                              }
+                            >
+                              Complete Work
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() =>
+                                void mutate(async () => {
+                                  await invoke("core_work_lifecycle", {
+                                    companyId: activeCompany.id,
+                                    projectId: activeProject.id,
+                                    workId: activeWorkItem.id,
+                                    action: "fail",
+                                    expectedVersion: activeWorkItem.row_version,
+                                  });
+                                  await loadWorkItems(
+                                    activeCompany.id,
+                                    activeProject.id,
+                                  );
+                                })
+                              }
+                            >
+                              Fail Work
+                            </button>
+                          </>
+                        )}
+                      </div>
+
+                      <div>
+                        <h4>Dependencies</h4>
+                        <ul>
+                          {dependencies.map((dep) => (
+                            <li key={dep.id}>
+                              {dep.dependency_type} on{" "}
+                              {dep.depends_on_work_item_id}
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() =>
+                                  void mutate(async () => {
+                                    await invoke("core_delete_dependency", {
+                                      companyId: activeCompany.id,
+                                      projectId: activeProject.id,
+                                      workId: activeWorkItem.id,
+                                      dependencyId: dep.id,
+                                    });
+                                    await loadWorkDetails(
+                                      activeCompany.id,
+                                      activeProject.id,
+                                      activeWorkItem.id,
+                                    );
+                                  })
+                                }
+                              >
+                                Remove Dependency
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+
+                      <div>
+                        <h4>Assignments & History</h4>
+                        <ul>
+                          {assignments.map((assign) => (
+                            <li key={assign.id}>
+                              Agent {assign.agent_id} ({assign.status})
+                              {assign.status === "ACTIVE" && (
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() =>
+                                    void mutate(async () => {
+                                      const newAgentId = window.prompt(
+                                        "Enter new Agent ID:",
+                                      );
+                                      if (!newAgentId) return;
+                                      await invoke(
+                                        "core_assignment_lifecycle",
+                                        {
+                                          companyId: activeCompany.id,
+                                          projectId: activeProject.id,
+                                          workId: activeWorkItem.id,
+                                          assignmentId: assign.id,
+                                          req: {
+                                            expected_version:
+                                              assign.row_version,
+                                          },
+                                        },
+                                      );
+                                      await invoke("core_create_assignment", {
+                                        companyId: activeCompany.id,
+                                        projectId: activeProject.id,
+                                        workId: activeWorkItem.id,
+                                        req: {
+                                          agent_id: newAgentId,
+                                          allocation_id: assign.allocation_id,
+                                          is_primary: true,
+                                        },
+                                      });
+                                      await loadWorkDetails(
+                                        activeCompany.id,
+                                        activeProject.id,
+                                        activeWorkItem.id,
+                                      );
+                                    })
+                                  }
+                                >
+                                  Reassign
+                                </button>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </article>
+                  )}
+                </section>
               )}
             </section>
           )}

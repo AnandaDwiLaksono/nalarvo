@@ -1,7 +1,10 @@
 use chrono::{DateTime, Duration, Utc};
 use nalarvo_domain::{
-    Company, CompanyId, CompanyStatus, DomainError, DomainEvent, OutboxMessage, OutboxStatus,
-    PrincipalRef, PrincipalType, ScopeRef, ScopeType, UserId, WorkspaceId,
+    AgentAllocation, AgentAllocationStatus, AssignmentStatus, Company, CompanyId, CompanyStatus,
+    DependencyType, DomainError, DomainEvent, Objective, ObjectiveStatus, OutboxMessage,
+    OutboxStatus, PrincipalRef, PrincipalType, Project, ProjectStatus, ScopeRef, ScopeType,
+    StaffingRequirement, StaffingRequirementStatus, Team, TeamStatus, UserId, WorkAssignment,
+    WorkDependency, WorkItem, WorkItemStatus, WorkspaceId,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -237,6 +240,30 @@ pub async fn insert_company_tx(
     Ok(())
 }
 
+pub async fn insert_project_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    project: &Project,
+) -> Result<(), PersistenceError> {
+    sqlx::query("INSERT INTO projects (id, company_id, name, description, priority, owner_user_id, target_outcome, target_date, working_root_path, working_root_bound_at, status, row_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(&project.id)
+        .bind(&project.company_id.0)
+        .bind(&project.name)
+        .bind(&project.description)
+        .bind(project.priority.to_string())
+        .bind(project.owner_user_id.as_ref().map(|u| &u.0))
+        .bind(&project.target_outcome)
+        .bind(&project.target_date)
+        .bind(&project.working_root_path)
+        .bind(project.working_root_bound_at.map(|v| v.to_rfc3339()))
+        .bind(project.status.to_string())
+        .bind(project.row_version)
+        .bind(project.created_at.to_rfc3339())
+        .bind(project.updated_at.to_rfc3339())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub async fn insert_domain_event_and_outbox_tx(
     tx: &mut Transaction<'_, Sqlite>,
     event: &DomainEvent,
@@ -320,6 +347,68 @@ pub async fn get_company_by_id(
     .await?;
 
     row.map(row_to_company).transpose()
+}
+
+pub async fn get_project(
+    pool: &SqlitePool,
+    company_id: &CompanyId,
+    project_id: &str,
+) -> Result<Option<Project>, PersistenceError> {
+    let row = sqlx::query("SELECT id, company_id, name, description, priority, owner_user_id, target_outcome, target_date, working_root_path, working_root_bound_at, status, row_version, created_at, updated_at FROM projects WHERE company_id = ? AND id = ?")
+        .bind(&company_id.0)
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await?;
+
+    if let Some(r) = row {
+        let id: String = r.get(0);
+        let cid: String = r.get(1);
+        let name: String = r.get(2);
+        let description: Option<String> = r.get(3);
+        let priority_str: String = r.get(4);
+        let owner_user_id: Option<String> = r.get(5);
+        let target_outcome: Option<String> = r.get(6);
+        let target_date: Option<String> = r.get(7);
+        let working_root_path: Option<String> = r.get(8);
+        let bound_at_str: Option<String> = r.get(9);
+        let status_str: String = r.get(10);
+        let row_version: i64 = r.get(11);
+        let created_at_str: String = r.get(12);
+        let updated_at_str: String = r.get(13);
+
+        let priority = priority_str.parse()?;
+        let status = ProjectStatus::from_str(&status_str)?;
+        let bound_at = bound_at_str.map(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .unwrap()
+                .with_timezone(&Utc)
+        });
+        let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        Ok(Some(Project {
+            id,
+            company_id: CompanyId(cid),
+            name,
+            description,
+            priority,
+            owner_user_id: owner_user_id.map(UserId),
+            target_outcome,
+            target_date,
+            working_root_path,
+            working_root_bound_at: bound_at,
+            status,
+            row_version,
+            created_at,
+            updated_at,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn list_companies(
@@ -1446,6 +1535,835 @@ fn workforce_row(row: sqlx::sqlite::SqliteRow) -> WorkforceRecord {
         name: row.get(1),
         status: row.get(2),
     }
+}
+
+pub async fn insert_work_item_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    item: &WorkItem,
+) -> Result<(), PersistenceError> {
+    sqlx::query("INSERT INTO work_items (id, company_id, project_id, objective_id, parent_work_item_id, title, description, logical_type, status, row_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(&item.id).bind(&item.company_id.0).bind(&item.project_id)
+        .bind(&item.objective_id).bind(&item.parent_work_item_id)
+        .bind(&item.title).bind(&item.description).bind(item.work_type.to_string())
+        .bind(item.status.to_string()).bind(item.row_version)
+        .bind(item.created_at.to_rfc3339()).bind(item.updated_at.to_rfc3339())
+        .execute(&mut **tx).await?;
+    Ok(())
+}
+
+fn parse_m3_time(value: String) -> Result<DateTime<Utc>, PersistenceError> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|date| date.with_timezone(&Utc))
+        .map_err(|error| {
+            DomainError::Validation(format!("Invalid persisted timestamp: {error}")).into()
+        })
+}
+
+fn work_item_row(row: sqlx::sqlite::SqliteRow) -> Result<WorkItem, PersistenceError> {
+    Ok(WorkItem {
+        id: row.get("id"),
+        company_id: CompanyId(row.get("company_id")),
+        project_id: row.get("project_id"),
+        objective_id: row.get("objective_id"),
+        parent_work_item_id: row.get("parent_work_item_id"),
+        title: row.get("title"),
+        description: row.get("description"),
+        work_type: row.get::<String, _>("logical_type").parse()?,
+        status: row.get::<String, _>("status").parse()?,
+        row_version: row.get("row_version"),
+        created_at: parse_m3_time(row.get("created_at"))?,
+        updated_at: parse_m3_time(row.get("updated_at"))?,
+    })
+}
+
+pub async fn get_work_item(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    id: &str,
+) -> Result<Option<WorkItem>, PersistenceError> {
+    sqlx::query("SELECT * FROM work_items WHERE company_id = ? AND id = ?")
+        .bind(&company.0)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .map(work_item_row)
+        .transpose()
+}
+
+pub async fn list_work_items(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project: &str,
+) -> Result<Vec<WorkItem>, PersistenceError> {
+    sqlx::query(
+        "SELECT * FROM work_items WHERE company_id = ? AND project_id = ? ORDER BY created_at, id",
+    )
+    .bind(&company.0)
+    .bind(project)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(work_item_row)
+    .collect()
+}
+
+pub async fn insert_work_dependency_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    dependency: &WorkDependency,
+) -> Result<(), PersistenceError> {
+    if dependency.dependency_type == DependencyType::Hard {
+        let mut edges = Vec::new();
+        let rows = sqlx::query(
+            "SELECT work_item_id, depends_on_work_item_id FROM work_dependencies WHERE company_id = ? AND project_id = ? AND dependency_kind = 'HARD'",
+        )
+        .bind(&dependency.company_id.0)
+        .bind(&dependency.project_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for row in rows {
+            edges.push((row.get::<String, _>(0), row.get::<String, _>(1)));
+        }
+        let refs: Vec<(&str, &str)> = edges
+            .iter()
+            .map(|(from, to)| (from.as_str(), to.as_str()))
+            .collect();
+        if nalarvo_domain::would_create_cycle(
+            &refs,
+            &dependency.work_item_id,
+            &dependency.depends_on_work_item_id,
+        ) {
+            return Err(PersistenceError::Domain(DomainError::Validation(
+                "Hard dependency cycle rejected".into(),
+            )));
+        }
+    }
+    sqlx::query(
+        "INSERT INTO work_dependencies (company_id, project_id, work_item_id, depends_on_work_item_id, dependency_kind, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&dependency.company_id.0)
+    .bind(&dependency.project_id)
+    .bind(&dependency.work_item_id)
+    .bind(&dependency.depends_on_work_item_id)
+    .bind(dependency.dependency_type.to_string())
+    .bind(dependency.created_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_work_dependencies(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project: &str,
+) -> Result<Vec<WorkDependency>, PersistenceError> {
+    let rows = sqlx::query("SELECT company_id, project_id, work_item_id, depends_on_work_item_id, dependency_kind, created_at FROM work_dependencies WHERE company_id = ? AND project_id = ? ORDER BY created_at")
+        .bind(&company.0).bind(project).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            let work_item_id: String = row.get("work_item_id");
+            let depends_on_work_item_id: String = row.get("depends_on_work_item_id");
+            let dep_id = hash_request(
+                format!(
+                    "{}:{}:{}:{}",
+                    company.0, project, work_item_id, depends_on_work_item_id
+                )
+                .as_bytes(),
+            );
+            Ok(WorkDependency {
+                id: dep_id,
+                company_id: company.clone(),
+                project_id: project.into(),
+                work_item_id,
+                depends_on_work_item_id,
+                dependency_type: row.get::<String, _>("dependency_kind").parse()?,
+                created_at: parse_m3_time(row.get("created_at"))?,
+            })
+        })
+        .collect()
+}
+
+pub async fn update_work_item_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    company: &CompanyId,
+    id: &str,
+    status: WorkItemStatus,
+    expected_version: i64,
+) -> Result<(), PersistenceError> {
+    let result = sqlx::query("UPDATE work_items SET status = ?, row_version = row_version + 1, updated_at = ? WHERE company_id = ? AND id = ? AND row_version = ?")
+        .bind(status.to_string()).bind(Utc::now().to_rfc3339()).bind(&company.0).bind(id).bind(expected_version)
+        .execute(&mut **tx).await?;
+    if result.rows_affected() == 0 {
+        let row = sqlx::query("SELECT row_version FROM work_items WHERE company_id = ? AND id = ?")
+            .bind(&company.0)
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        return match row {
+            Some(row) => Err(PersistenceError::StaleVersion {
+                current: row.get(0),
+                expected: expected_version,
+            }),
+            None => Err(PersistenceError::NotFound(id.into())),
+        };
+    }
+    Ok(())
+}
+
+// M3 Objective
+pub async fn insert_objective_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    obj: &Objective,
+) -> Result<(), PersistenceError> {
+    sqlx::query(
+        "INSERT INTO objectives (id, company_id, project_id, parent_objective_id, title, description, is_primary, is_required, status, row_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&obj.id)
+    .bind(&obj.company_id.0)
+    .bind(&obj.project_id)
+    .bind(&obj.parent_objective_id)
+    .bind(&obj.title)
+    .bind(&obj.description)
+    .bind(if obj.is_primary { 1 } else { 0 })
+    .bind(if obj.is_required { 1 } else { 0 })
+    .bind(obj.status.to_string())
+    .bind(obj.row_version)
+    .bind(obj.created_at.to_rfc3339())
+    .bind(obj.updated_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn objective_row(row: sqlx::sqlite::SqliteRow) -> Result<Objective, PersistenceError> {
+    let is_primary_int: i64 = row.get("is_primary");
+    let is_required_int: i64 = row.get("is_required");
+    Ok(Objective {
+        id: row.get("id"),
+        company_id: CompanyId(row.get("company_id")),
+        project_id: row.get("project_id"),
+        parent_objective_id: row.get("parent_objective_id"),
+        title: row.get("title"),
+        description: row.get("description"),
+        is_primary: is_primary_int != 0,
+        is_required: is_required_int != 0,
+        status: row.get::<String, _>("status").parse()?,
+        row_version: row.get("row_version"),
+        created_at: parse_m3_time(row.get("created_at"))?,
+        updated_at: parse_m3_time(row.get("updated_at"))?,
+    })
+}
+
+pub async fn get_objective(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    id: &str,
+) -> Result<Option<Objective>, PersistenceError> {
+    sqlx::query("SELECT * FROM objectives WHERE company_id = ? AND id = ?")
+        .bind(&company.0)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .map(objective_row)
+        .transpose()
+}
+
+pub async fn list_objectives(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project: &str,
+) -> Result<Vec<Objective>, PersistenceError> {
+    sqlx::query(
+        "SELECT * FROM objectives WHERE company_id = ? AND project_id = ? ORDER BY created_at, id",
+    )
+    .bind(&company.0)
+    .bind(project)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(objective_row)
+    .collect()
+}
+
+pub async fn update_objective_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    company: &CompanyId,
+    id: &str,
+    status: ObjectiveStatus,
+    expected_version: i64,
+) -> Result<(), PersistenceError> {
+    let result = sqlx::query(
+        "UPDATE objectives SET status = ?, row_version = row_version + 1, updated_at = ? WHERE company_id = ? AND id = ? AND row_version = ?",
+    )
+    .bind(status.to_string())
+    .bind(Utc::now().to_rfc3339())
+    .bind(&company.0)
+    .bind(id)
+    .bind(expected_version)
+    .execute(&mut **tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        let row = sqlx::query("SELECT row_version FROM objectives WHERE company_id = ? AND id = ?")
+            .bind(&company.0)
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        return match row {
+            Some(row) => Err(PersistenceError::StaleVersion {
+                current: row.get(0),
+                expected: expected_version,
+            }),
+            None => Err(PersistenceError::NotFound(id.into())),
+        };
+    }
+    Ok(())
+}
+
+// M3 Team
+pub async fn insert_team_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    team: &Team,
+) -> Result<(), PersistenceError> {
+    sqlx::query(
+        "INSERT INTO teams (id, company_id, project_id, name, is_primary, status, row_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&team.id)
+    .bind(&team.company_id.0)
+    .bind(&team.project_id)
+    .bind(&team.name)
+    .bind(if team.is_primary { 1 } else { 0 })
+    .bind(team.status.to_string())
+    .bind(team.row_version)
+    .bind(team.created_at.to_rfc3339())
+    .bind(team.updated_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn team_row(row: sqlx::sqlite::SqliteRow) -> Result<Team, PersistenceError> {
+    let is_primary_int: i64 = row.get("is_primary");
+    Ok(Team {
+        id: row.get("id"),
+        company_id: CompanyId(row.get("company_id")),
+        project_id: row.get("project_id"),
+        name: row.get("name"),
+        is_primary: is_primary_int != 0,
+        status: row.get::<String, _>("status").parse()?,
+        row_version: row.get("row_version"),
+        created_at: parse_m3_time(row.get("created_at"))?,
+        updated_at: parse_m3_time(row.get("updated_at"))?,
+    })
+}
+
+pub async fn get_team(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    id: &str,
+) -> Result<Option<Team>, PersistenceError> {
+    sqlx::query("SELECT * FROM teams WHERE company_id = ? AND id = ?")
+        .bind(&company.0)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .map(team_row)
+        .transpose()
+}
+
+pub async fn list_teams(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project: &str,
+) -> Result<Vec<Team>, PersistenceError> {
+    sqlx::query(
+        "SELECT * FROM teams WHERE company_id = ? AND project_id = ? ORDER BY created_at, id",
+    )
+    .bind(&company.0)
+    .bind(project)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(team_row)
+    .collect()
+}
+
+pub async fn update_team_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    company: &CompanyId,
+    id: &str,
+    status: TeamStatus,
+    expected_version: i64,
+) -> Result<(), PersistenceError> {
+    let result = sqlx::query(
+        "UPDATE teams SET status = ?, row_version = row_version + 1, updated_at = ? WHERE company_id = ? AND id = ? AND row_version = ?",
+    )
+    .bind(status.to_string())
+    .bind(Utc::now().to_rfc3339())
+    .bind(&company.0)
+    .bind(id)
+    .bind(expected_version)
+    .execute(&mut **tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        let row = sqlx::query("SELECT row_version FROM teams WHERE company_id = ? AND id = ?")
+            .bind(&company.0)
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        return match row {
+            Some(row) => Err(PersistenceError::StaleVersion {
+                current: row.get(0),
+                expected: expected_version,
+            }),
+            None => Err(PersistenceError::NotFound(id.into())),
+        };
+    }
+    Ok(())
+}
+
+// M3 StaffingRequirement
+pub async fn insert_staffing_requirement_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    req: &StaffingRequirement,
+) -> Result<(), PersistenceError> {
+    let caps_json = serde_json::to_string(&req.required_capability_ids)
+        .map_err(|e| DomainError::Validation(e.to_string()))?;
+    sqlx::query(
+        "INSERT INTO staffing_requirements (id, company_id, project_id, team_id, role_id, department_id, desired_count, required_capability_ids, status, row_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&req.id)
+    .bind(&req.company_id.0)
+    .bind(&req.project_id)
+    .bind(&req.team_id)
+    .bind(&req.role_id)
+    .bind(&req.department_id)
+    .bind(req.desired_count as i64)
+    .bind(caps_json)
+    .bind(req.status.to_string())
+    .bind(req.row_version)
+    .bind(req.created_at.to_rfc3339())
+    .bind(req.updated_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn staffing_requirement_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StaffingRequirement, PersistenceError> {
+    let count: i64 = row.get("desired_count");
+    let caps_str: String = row.get("required_capability_ids");
+    let caps: Vec<String> = serde_json::from_str(&caps_str).map_err(|error| {
+        DomainError::Validation(format!("Invalid persisted capabilities: {error}"))
+    })?;
+    Ok(StaffingRequirement {
+        id: row.get("id"),
+        company_id: CompanyId(row.get("company_id")),
+        project_id: row.get("project_id"),
+        team_id: row.get("team_id"),
+        role_id: row.get("role_id"),
+        department_id: row.get("department_id"),
+        desired_count: count as u32,
+        required_capability_ids: caps,
+        status: row.get::<String, _>("status").parse()?,
+        row_version: row.get("row_version"),
+        created_at: parse_m3_time(row.get("created_at"))?,
+        updated_at: parse_m3_time(row.get("updated_at"))?,
+    })
+}
+
+pub async fn get_staffing_requirement(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    id: &str,
+) -> Result<Option<StaffingRequirement>, PersistenceError> {
+    sqlx::query("SELECT * FROM staffing_requirements WHERE company_id = ? AND id = ?")
+        .bind(&company.0)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .map(staffing_requirement_row)
+        .transpose()
+}
+
+pub async fn list_staffing_requirements(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project: &str,
+) -> Result<Vec<StaffingRequirement>, PersistenceError> {
+    sqlx::query("SELECT * FROM staffing_requirements WHERE company_id = ? AND project_id = ? ORDER BY created_at, id")
+        .bind(&company.0)
+        .bind(project)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(staffing_requirement_row)
+        .collect()
+}
+
+pub async fn update_staffing_requirement_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    company: &CompanyId,
+    id: &str,
+    status: StaffingRequirementStatus,
+    expected_version: i64,
+) -> Result<(), PersistenceError> {
+    let result = sqlx::query(
+        "UPDATE staffing_requirements SET status = ?, row_version = row_version + 1, updated_at = ? WHERE company_id = ? AND id = ? AND row_version = ?",
+    )
+    .bind(status.to_string())
+    .bind(Utc::now().to_rfc3339())
+    .bind(&company.0)
+    .bind(id)
+    .bind(expected_version)
+    .execute(&mut **tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        let row = sqlx::query(
+            "SELECT row_version FROM staffing_requirements WHERE company_id = ? AND id = ?",
+        )
+        .bind(&company.0)
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        return match row {
+            Some(row) => Err(PersistenceError::StaleVersion {
+                current: row.get(0),
+                expected: expected_version,
+            }),
+            None => Err(PersistenceError::NotFound(id.into())),
+        };
+    }
+    Ok(())
+}
+
+// M3 AgentAllocation
+pub async fn insert_agent_allocation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    alloc: &AgentAllocation,
+) -> Result<(), PersistenceError> {
+    sqlx::query(
+        "INSERT INTO agent_allocations (id, company_id, project_id, team_id, agent_id, staffing_requirement_id, status, row_version, created_at, updated_at, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&alloc.id)
+    .bind(&alloc.company_id.0)
+    .bind(&alloc.project_id)
+    .bind(&alloc.team_id)
+    .bind(&alloc.agent_id)
+    .bind(&alloc.staffing_requirement_id)
+    .bind(alloc.status.to_string())
+    .bind(alloc.row_version)
+    .bind(alloc.created_at.to_rfc3339())
+    .bind(alloc.updated_at.to_rfc3339())
+    .bind(alloc.released_at.map(|t| t.to_rfc3339()))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn agent_allocation_row(row: sqlx::sqlite::SqliteRow) -> Result<AgentAllocation, PersistenceError> {
+    let released_str: Option<String> = row.get("released_at");
+    let released_at = released_str.map(parse_m3_time).transpose()?;
+    Ok(AgentAllocation {
+        id: row.get("id"),
+        company_id: CompanyId(row.get("company_id")),
+        project_id: row.get("project_id"),
+        team_id: row.get("team_id"),
+        agent_id: row.get("agent_id"),
+        staffing_requirement_id: row.get("staffing_requirement_id"),
+        status: row.get::<String, _>("status").parse()?,
+        row_version: row.get("row_version"),
+        created_at: parse_m3_time(row.get("created_at"))?,
+        updated_at: parse_m3_time(row.get("updated_at"))?,
+        released_at,
+    })
+}
+
+pub async fn get_agent_allocation(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    id: &str,
+) -> Result<Option<AgentAllocation>, PersistenceError> {
+    sqlx::query("SELECT * FROM agent_allocations WHERE company_id = ? AND id = ?")
+        .bind(&company.0)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .map(agent_allocation_row)
+        .transpose()
+}
+
+pub async fn list_agent_allocations(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project: &str,
+) -> Result<Vec<AgentAllocation>, PersistenceError> {
+    sqlx::query("SELECT * FROM agent_allocations WHERE company_id = ? AND project_id = ? ORDER BY created_at, id")
+        .bind(&company.0)
+        .bind(project)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(agent_allocation_row)
+        .collect()
+}
+
+pub async fn update_agent_allocation_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    company: &CompanyId,
+    id: &str,
+    status: AgentAllocationStatus,
+    expected_version: i64,
+) -> Result<(), PersistenceError> {
+    let now = Utc::now().to_rfc3339();
+    let released_at = if matches!(
+        status,
+        AgentAllocationStatus::Released | AgentAllocationStatus::Cancelled
+    ) {
+        Some(now.clone())
+    } else {
+        None
+    };
+    let result = sqlx::query(
+        "UPDATE agent_allocations SET status = ?, released_at = COALESCE(?, released_at), row_version = row_version + 1, updated_at = ? WHERE company_id = ? AND id = ? AND row_version = ?",
+    )
+    .bind(status.to_string())
+    .bind(released_at)
+    .bind(&now)
+    .bind(&company.0)
+    .bind(id)
+    .bind(expected_version)
+    .execute(&mut **tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        let row = sqlx::query(
+            "SELECT row_version FROM agent_allocations WHERE company_id = ? AND id = ?",
+        )
+        .bind(&company.0)
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        return match row {
+            Some(row) => Err(PersistenceError::StaleVersion {
+                current: row.get(0),
+                expected: expected_version,
+            }),
+            None => Err(PersistenceError::NotFound(id.into())),
+        };
+    }
+    Ok(())
+}
+
+// M3 WorkAssignment
+pub async fn insert_work_assignment_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    assign: &WorkAssignment,
+    allocation_id: &str,
+) -> Result<(), PersistenceError> {
+    sqlx::query(
+        "INSERT INTO assignments (id, company_id, project_id, work_item_id, agent_id, agent_allocation_id, is_primary, status, row_version, assigned_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&assign.id)
+    .bind(&assign.company_id.0)
+    .bind(&assign.project_id)
+    .bind(&assign.work_item_id)
+    .bind(&assign.agent_id)
+    .bind(allocation_id)
+    .bind(if assign.is_primary { 1 } else { 0 })
+    .bind(assign.status.to_string())
+    .bind(assign.row_version)
+    .bind(assign.created_at.to_rfc3339())
+    .bind(assign.released_at.map(|t| t.to_rfc3339()))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn work_assignment_row(row: sqlx::sqlite::SqliteRow) -> Result<WorkAssignment, PersistenceError> {
+    let is_primary_int: i64 = row.get("is_primary");
+    let ended_str: Option<String> = row.get("ended_at");
+    let released_at = ended_str.map(parse_m3_time).transpose()?;
+    let assigned_at = parse_m3_time(row.get("assigned_at"))?;
+    Ok(WorkAssignment {
+        id: row.get("id"),
+        company_id: CompanyId(row.get("company_id")),
+        project_id: row.get("project_id"),
+        work_item_id: row.get("work_item_id"),
+        agent_id: row.get("agent_id"),
+        is_primary: is_primary_int != 0,
+        status: row.get::<String, _>("status").parse()?,
+        row_version: row.get("row_version"),
+        created_at: assigned_at,
+        updated_at: assigned_at,
+        released_at,
+    })
+}
+
+pub async fn get_work_assignment(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    id: &str,
+) -> Result<Option<WorkAssignment>, PersistenceError> {
+    sqlx::query("SELECT * FROM assignments WHERE company_id = ? AND id = ?")
+        .bind(&company.0)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .map(work_assignment_row)
+        .transpose()
+}
+
+pub async fn list_work_assignments(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project: &str,
+) -> Result<Vec<WorkAssignment>, PersistenceError> {
+    sqlx::query("SELECT * FROM assignments WHERE company_id = ? AND project_id = ? ORDER BY assigned_at, id")
+        .bind(&company.0)
+        .bind(project)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(work_assignment_row)
+        .collect()
+}
+
+pub async fn update_work_assignment_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    company: &CompanyId,
+    id: &str,
+    status: AssignmentStatus,
+    expected_version: i64,
+) -> Result<(), PersistenceError> {
+    let now = Utc::now().to_rfc3339();
+    let ended_at = if matches!(
+        status,
+        AssignmentStatus::Released | AssignmentStatus::Cancelled
+    ) {
+        Some(now.clone())
+    } else {
+        None
+    };
+    let result = sqlx::query(
+        "UPDATE assignments SET status = ?, ended_at = COALESCE(?, ended_at), row_version = row_version + 1 WHERE company_id = ? AND id = ? AND row_version = ?",
+    )
+    .bind(status.to_string())
+    .bind(ended_at)
+    .bind(&company.0)
+    .bind(id)
+    .bind(expected_version)
+    .execute(&mut **tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        let row =
+            sqlx::query("SELECT row_version FROM assignments WHERE company_id = ? AND id = ?")
+                .bind(&company.0)
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        return match row {
+            Some(row) => Err(PersistenceError::StaleVersion {
+                current: row.get(0),
+                expected: expected_version,
+            }),
+            None => Err(PersistenceError::NotFound(id.into())),
+        };
+    }
+    Ok(())
+}
+
+// M3 Blocker
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockerRecord {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub reason: String,
+    pub resolved_at: Option<String>,
+    pub created_at: String,
+}
+
+pub async fn create_blocker(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project_id: &str,
+    work_item_id: &str,
+    reason: &str,
+) -> Result<BlockerRecord, PersistenceError> {
+    let id = Uuid::now_v7().to_string();
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO blockers (id, company_id, project_id, work_item_id, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&company.0)
+    .bind(project_id)
+    .bind(work_item_id)
+    .bind(reason)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    Ok(BlockerRecord {
+        id,
+        company_id: company.0.clone(),
+        project_id: project_id.to_string(),
+        work_item_id: work_item_id.to_string(),
+        reason: reason.to_string(),
+        resolved_at: None,
+        created_at: now,
+    })
+}
+
+pub async fn resolve_blocker(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    id: &str,
+) -> Result<(), PersistenceError> {
+    let now = Utc::now().to_rfc3339();
+    let result = sqlx::query("UPDATE blockers SET resolved_at = ? WHERE company_id = ? AND id = ?")
+        .bind(&now)
+        .bind(&company.0)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(PersistenceError::NotFound(id.into()));
+    }
+    Ok(())
+}
+
+pub async fn list_blockers(
+    pool: &SqlitePool,
+    company: &CompanyId,
+    project_id: &str,
+) -> Result<Vec<BlockerRecord>, PersistenceError> {
+    let rows = sqlx::query(
+        "SELECT id, company_id, project_id, work_item_id, reason, resolved_at, created_at FROM blockers WHERE company_id = ? AND project_id = ? ORDER BY created_at",
+    )
+    .bind(&company.0)
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| BlockerRecord {
+            id: r.get(0),
+            company_id: r.get(1),
+            project_id: r.get(2),
+            work_item_id: r.get(3),
+            reason: r.get(4),
+            resolved_at: r.get(5),
+            created_at: r.get(6),
+        })
+        .collect())
 }
 
 fn row_to_company(row: sqlx::sqlite::SqliteRow) -> Result<Company, PersistenceError> {

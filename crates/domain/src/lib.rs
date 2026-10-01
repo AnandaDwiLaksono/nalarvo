@@ -1084,6 +1084,956 @@ impl Agent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProjectStatus {
+    Draft,
+    Staffing,
+    Active,
+    Paused,
+    Completed,
+    Cancelled,
+    Archived,
+}
+
+impl fmt::Display for ProjectStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Draft => write!(f, "DRAFT"),
+            Self::Staffing => write!(f, "STAFFING"),
+            Self::Active => write!(f, "ACTIVE"),
+            Self::Paused => write!(f, "PAUSED"),
+            Self::Completed => write!(f, "COMPLETED"),
+            Self::Cancelled => write!(f, "CANCELLED"),
+            Self::Archived => write!(f, "ARCHIVED"),
+        }
+    }
+}
+
+impl std::str::FromStr for ProjectStatus {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "DRAFT" => Ok(Self::Draft),
+            "STAFFING" => Ok(Self::Staffing),
+            "ACTIVE" => Ok(Self::Active),
+            "PAUSED" => Ok(Self::Paused),
+            "COMPLETED" => Ok(Self::Completed),
+            "CANCELLED" => Ok(Self::Cancelled),
+            "ARCHIVED" => Ok(Self::Archived),
+            other => Err(DomainError::Validation(format!(
+                "Invalid project status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProjectPriority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl fmt::Display for ProjectPriority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Low => write!(f, "LOW"),
+            Self::Medium => write!(f, "MEDIUM"),
+            Self::High => write!(f, "HIGH"),
+            Self::Critical => write!(f, "CRITICAL"),
+        }
+    }
+}
+
+impl std::str::FromStr for ProjectPriority {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "LOW" => Ok(Self::Low),
+            "MEDIUM" => Ok(Self::Medium),
+            "HIGH" => Ok(Self::High),
+            "CRITICAL" => Ok(Self::Critical),
+            other => Err(DomainError::Validation(format!(
+                "Invalid project priority: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub name: String,
+    pub description: Option<String>,
+    pub priority: ProjectPriority,
+    pub owner_user_id: Option<UserId>,
+    pub target_outcome: Option<String>,
+    pub target_date: Option<String>,
+    pub working_root_path: Option<String>,
+    pub working_root_bound_at: Option<DateTime<Utc>>,
+    pub status: ProjectStatus,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Project {
+    pub fn create(
+        company_id: CompanyId,
+        name: String,
+        description: Option<String>,
+    ) -> Result<Self, DomainError> {
+        let name = required("Project name", name)?;
+        let now = Utc::now();
+        Ok(Self {
+            id: Uuid::now_v7().to_string(),
+            company_id,
+            name,
+            description,
+            priority: ProjectPriority::Medium,
+            owner_user_id: None,
+            target_outcome: None,
+            target_date: None,
+            working_root_path: None,
+            working_root_bound_at: None,
+            status: ProjectStatus::Draft,
+            row_version: 1,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn activate(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if !matches!(
+            self.status,
+            ProjectStatus::Draft | ProjectStatus::Staffing | ProjectStatus::Paused
+        ) {
+            return Err(DomainError::Validation(
+                "Invalid project activation transition".into(),
+            ));
+        }
+        self.status = ProjectStatus::Active;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn start_staffing(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status != ProjectStatus::Draft {
+            return Err(DomainError::Validation(
+                "Invalid staffing transition".into(),
+            ));
+        }
+        self.status = ProjectStatus::Staffing;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn pause(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status != ProjectStatus::Active {
+            return Err(DomainError::Validation(
+                "Invalid project pause transition".into(),
+            ));
+        }
+        self.status = ProjectStatus::Paused;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn resume(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        self.activate(expected_version)
+    }
+
+    pub fn complete(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status != ProjectStatus::Active {
+            return Err(DomainError::Validation(
+                "Project must be active to complete".into(),
+            ));
+        }
+        self.status = ProjectStatus::Completed;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn cancel(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if !matches!(
+            self.status,
+            ProjectStatus::Draft
+                | ProjectStatus::Staffing
+                | ProjectStatus::Active
+                | ProjectStatus::Paused
+        ) {
+            return Err(DomainError::Validation(
+                "Cannot cancel project from terminal or archived status".into(),
+            ));
+        }
+        self.status = ProjectStatus::Cancelled;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn archive(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if !matches!(
+            self.status,
+            ProjectStatus::Completed | ProjectStatus::Cancelled
+        ) {
+            return Err(DomainError::Validation(
+                "Only completed or cancelled projects can be archived".into(),
+            ));
+        }
+        self.status = ProjectStatus::Archived;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn bind_working_root(
+        &mut self,
+        path: String,
+        expected_version: i64,
+    ) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        let path = required("Working root path", path)?;
+        let p = std::path::Path::new(&path);
+        if !p.exists() || !p.is_dir() {
+            return Err(DomainError::Validation(
+                "Working root directory must exist".into(),
+            ));
+        }
+        let canonical = p
+            .canonicalize()
+            .map_err(|e| DomainError::Validation(format!("Invalid working root: {e}")))?;
+        self.working_root_path = Some(canonical.to_string_lossy().to_string());
+        self.working_root_bound_at = Some(Utc::now());
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn unbind_working_root(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        self.working_root_path = None;
+        self.working_root_bound_at = None;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ObjectiveStatus {
+    Draft,
+    Active,
+    Achieved,
+    Failed,
+    Cancelled,
+    Archived,
+}
+
+impl fmt::Display for ObjectiveStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Draft => write!(f, "DRAFT"),
+            Self::Active => write!(f, "ACTIVE"),
+            Self::Achieved => write!(f, "ACHIEVED"),
+            Self::Failed => write!(f, "FAILED"),
+            Self::Cancelled => write!(f, "CANCELLED"),
+            Self::Archived => write!(f, "ARCHIVED"),
+        }
+    }
+}
+
+impl std::str::FromStr for ObjectiveStatus {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "DRAFT" => Ok(Self::Draft),
+            "ACTIVE" => Ok(Self::Active),
+            "ACHIEVED" => Ok(Self::Achieved),
+            "FAILED" => Ok(Self::Failed),
+            "CANCELLED" => Ok(Self::Cancelled),
+            "ARCHIVED" => Ok(Self::Archived),
+            other => Err(DomainError::Validation(format!(
+                "Invalid objective status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Objective {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub project_id: String,
+    pub parent_objective_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub is_primary: bool,
+    pub is_required: bool,
+    pub status: ObjectiveStatus,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Objective {
+    pub fn activate(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        transition(
+            &mut self.status,
+            ObjectiveStatus::Draft,
+            ObjectiveStatus::Active,
+            &mut self.row_version,
+            &mut self.updated_at,
+        )
+    }
+
+    pub fn finish(
+        &mut self,
+        status: ObjectiveStatus,
+        expected_version: i64,
+    ) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if !matches!(
+            status,
+            ObjectiveStatus::Achieved | ObjectiveStatus::Failed | ObjectiveStatus::Cancelled
+        ) {
+            return Err(DomainError::Validation(
+                "Invalid objective terminal status".into(),
+            ));
+        }
+        transition(
+            &mut self.status,
+            ObjectiveStatus::Active,
+            status,
+            &mut self.row_version,
+            &mut self.updated_at,
+        )
+    }
+
+    pub fn archive(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if !matches!(
+            self.status,
+            ObjectiveStatus::Achieved | ObjectiveStatus::Failed | ObjectiveStatus::Cancelled
+        ) {
+            return Err(DomainError::Validation(
+                "Only terminal objectives can be archived".into(),
+            ));
+        }
+        let previous = self.status;
+        transition(
+            &mut self.status,
+            previous,
+            ObjectiveStatus::Archived,
+            &mut self.row_version,
+            &mut self.updated_at,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TeamStatus {
+    Forming,
+    Active,
+    Paused,
+    Disbanded,
+    Archived,
+}
+
+impl fmt::Display for TeamStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Forming => write!(f, "FORMING"),
+            Self::Active => write!(f, "ACTIVE"),
+            Self::Paused => write!(f, "PAUSED"),
+            Self::Disbanded => write!(f, "DISBANDED"),
+            Self::Archived => write!(f, "ARCHIVED"),
+        }
+    }
+}
+
+impl std::str::FromStr for TeamStatus {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "FORMING" => Ok(Self::Forming),
+            "ACTIVE" => Ok(Self::Active),
+            "PAUSED" => Ok(Self::Paused),
+            "DISBANDED" => Ok(Self::Disbanded),
+            "ARCHIVED" => Ok(Self::Archived),
+            other => Err(DomainError::Validation(format!(
+                "Invalid team status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Team {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub project_id: String,
+    pub name: String,
+    pub is_primary: bool,
+    pub status: TeamStatus,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StaffingRequirementStatus {
+    Draft,
+    Open,
+    PartiallyFilled,
+    Filled,
+    Blocked,
+    Cancelled,
+}
+
+impl fmt::Display for StaffingRequirementStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Draft => write!(f, "DRAFT"),
+            Self::Open => write!(f, "OPEN"),
+            Self::PartiallyFilled => write!(f, "PARTIALLY_FILLED"),
+            Self::Filled => write!(f, "FILLED"),
+            Self::Blocked => write!(f, "BLOCKED"),
+            Self::Cancelled => write!(f, "CANCELLED"),
+        }
+    }
+}
+
+impl std::str::FromStr for StaffingRequirementStatus {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "DRAFT" => Ok(Self::Draft),
+            "OPEN" => Ok(Self::Open),
+            "PARTIALLY_FILLED" => Ok(Self::PartiallyFilled),
+            "FILLED" => Ok(Self::Filled),
+            "BLOCKED" => Ok(Self::Blocked),
+            "CANCELLED" => Ok(Self::Cancelled),
+            other => Err(DomainError::Validation(format!(
+                "Invalid staffing status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaffingRequirement {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub project_id: String,
+    pub team_id: Option<String>,
+    pub role_id: String,
+    pub department_id: Option<String>,
+    pub desired_count: u32,
+    pub required_capability_ids: Vec<String>,
+    pub status: StaffingRequirementStatus,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl StaffingRequirement {
+    pub fn open(&mut self) -> Result<(), DomainError> {
+        transition(
+            &mut self.status,
+            StaffingRequirementStatus::Draft,
+            StaffingRequirementStatus::Open,
+            &mut self.row_version,
+            &mut self.updated_at,
+        )
+    }
+
+    pub fn block(&mut self) -> Result<(), DomainError> {
+        if !matches!(
+            self.status,
+            StaffingRequirementStatus::Draft
+                | StaffingRequirementStatus::Open
+                | StaffingRequirementStatus::PartiallyFilled
+                | StaffingRequirementStatus::Filled
+        ) {
+            return Err(DomainError::Validation(
+                "Invalid staffing requirement block transition".into(),
+            ));
+        }
+        self.status = StaffingRequirementStatus::Blocked;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn unblock(&mut self) -> Result<(), DomainError> {
+        transition(
+            &mut self.status,
+            StaffingRequirementStatus::Blocked,
+            StaffingRequirementStatus::Open,
+            &mut self.row_version,
+            &mut self.updated_at,
+        )
+    }
+
+    pub fn cancel(&mut self) -> Result<(), DomainError> {
+        if self.status == StaffingRequirementStatus::Cancelled {
+            return Err(DomainError::Validation(
+                "Staffing requirement is already cancelled".into(),
+            ));
+        }
+        self.status = StaffingRequirementStatus::Cancelled;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn reconcile(&mut self, active_allocations: u32) {
+        let status = match self.status {
+            StaffingRequirementStatus::Draft
+            | StaffingRequirementStatus::Blocked
+            | StaffingRequirementStatus::Cancelled => return,
+            _ if active_allocations == 0 => StaffingRequirementStatus::Open,
+            _ if active_allocations < self.desired_count => {
+                StaffingRequirementStatus::PartiallyFilled
+            }
+            _ => StaffingRequirementStatus::Filled,
+        };
+        if self.status != status {
+            self.status = status;
+            self.row_version += 1;
+            self.updated_at = Utc::now();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentAllocationStatus {
+    Planned,
+    Active,
+    Paused,
+    Released,
+    Cancelled,
+}
+
+impl fmt::Display for AgentAllocationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Planned => write!(f, "PLANNED"),
+            Self::Active => write!(f, "ACTIVE"),
+            Self::Paused => write!(f, "PAUSED"),
+            Self::Released => write!(f, "RELEASED"),
+            Self::Cancelled => write!(f, "CANCELLED"),
+        }
+    }
+}
+
+impl std::str::FromStr for AgentAllocationStatus {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "PLANNED" => Ok(Self::Planned),
+            "ACTIVE" => Ok(Self::Active),
+            "PAUSED" => Ok(Self::Paused),
+            "RELEASED" => Ok(Self::Released),
+            "CANCELLED" => Ok(Self::Cancelled),
+            other => Err(DomainError::Validation(format!(
+                "Invalid allocation status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAllocation {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub project_id: String,
+    pub team_id: String,
+    pub agent_id: String,
+    pub staffing_requirement_id: Option<String>,
+    pub status: AgentAllocationStatus,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkItemType {
+    Task,
+    Research,
+    Review,
+    Deliverable,
+    Decision,
+    Maintenance,
+    Incident,
+}
+
+impl fmt::Display for WorkItemType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Task => write!(f, "TASK"),
+            Self::Research => write!(f, "RESEARCH"),
+            Self::Review => write!(f, "REVIEW"),
+            Self::Deliverable => write!(f, "DELIVERABLE"),
+            Self::Decision => write!(f, "DECISION"),
+            Self::Maintenance => write!(f, "MAINTENANCE"),
+            Self::Incident => write!(f, "INCIDENT"),
+        }
+    }
+}
+
+impl std::str::FromStr for WorkItemType {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "TASK" => Ok(Self::Task),
+            "RESEARCH" => Ok(Self::Research),
+            "REVIEW" => Ok(Self::Review),
+            "DELIVERABLE" => Ok(Self::Deliverable),
+            "DECISION" => Ok(Self::Decision),
+            "MAINTENANCE" => Ok(Self::Maintenance),
+            "INCIDENT" => Ok(Self::Incident),
+            other => Err(DomainError::Validation(format!(
+                "Invalid work item type: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkItemStatus {
+    Backlog,
+    Ready,
+    InProgress,
+    Blocked,
+    WaitingApproval,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl fmt::Display for WorkItemStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backlog => write!(f, "BACKLOG"),
+            Self::Ready => write!(f, "READY"),
+            Self::InProgress => write!(f, "IN_PROGRESS"),
+            Self::Blocked => write!(f, "BLOCKED"),
+            Self::WaitingApproval => write!(f, "WAITING_APPROVAL"),
+            Self::Completed => write!(f, "COMPLETED"),
+            Self::Failed => write!(f, "FAILED"),
+            Self::Cancelled => write!(f, "CANCELLED"),
+        }
+    }
+}
+
+impl WorkItemStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+impl std::str::FromStr for WorkItemStatus {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "BACKLOG" => Ok(Self::Backlog),
+            "READY" => Ok(Self::Ready),
+            "IN_PROGRESS" => Ok(Self::InProgress),
+            "BLOCKED" => Ok(Self::Blocked),
+            "WAITING_APPROVAL" => Ok(Self::WaitingApproval),
+            "COMPLETED" => Ok(Self::Completed),
+            "FAILED" => Ok(Self::Failed),
+            "CANCELLED" => Ok(Self::Cancelled),
+            other => Err(DomainError::Validation(format!(
+                "Invalid work item status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItem {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub project_id: String,
+    pub objective_id: Option<String>,
+    pub parent_work_item_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub work_type: WorkItemType,
+    pub status: WorkItemStatus,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl WorkItem {
+    pub fn create(
+        company_id: CompanyId,
+        project_id: String,
+        title: String,
+    ) -> Result<Self, DomainError> {
+        let title = required("Work title", title)?;
+        let now = Utc::now();
+        Ok(Self {
+            id: Uuid::now_v7().to_string(),
+            company_id,
+            project_id,
+            objective_id: None,
+            parent_work_item_id: None,
+            title,
+            description: None,
+            work_type: WorkItemType::Task,
+            status: WorkItemStatus::Backlog,
+            row_version: 1,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn ready(
+        &mut self,
+        expected_version: i64,
+        has_unresolved_hard_dep: bool,
+    ) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if has_unresolved_hard_dep {
+            return Err(DomainError::Validation(
+                "Cannot transition to READY with unresolved HARD dependencies".into(),
+            ));
+        }
+        if self.status != WorkItemStatus::Backlog {
+            return Err(DomainError::Validation(
+                "Can only mark BACKLOG work item as READY".into(),
+            ));
+        }
+        self.status = WorkItemStatus::Ready;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn start(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status != WorkItemStatus::Ready {
+            return Err(DomainError::Validation(
+                "Can only start READY work item".into(),
+            ));
+        }
+        self.status = WorkItemStatus::InProgress;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn complete(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status != WorkItemStatus::InProgress {
+            return Err(DomainError::Validation(
+                "Can only complete IN_PROGRESS work item".into(),
+            ));
+        }
+        self.status = WorkItemStatus::Completed;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn fail(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status != WorkItemStatus::InProgress {
+            return Err(DomainError::Validation(
+                "Can only fail IN_PROGRESS work item".into(),
+            ));
+        }
+        self.status = WorkItemStatus::Failed;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn cancel(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status.is_terminal() {
+            return Err(DomainError::Validation(
+                "Cannot cancel terminal work item".into(),
+            ));
+        }
+        self.status = WorkItemStatus::Cancelled;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn block(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status != WorkItemStatus::InProgress {
+            return Err(DomainError::Validation(
+                "Can only block IN_PROGRESS work item".into(),
+            ));
+        }
+        self.status = WorkItemStatus::Blocked;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn unblock(&mut self, expected_version: i64) -> Result<(), DomainError> {
+        check_version(self.row_version, expected_version)?;
+        if self.status != WorkItemStatus::Blocked {
+            return Err(DomainError::Validation(
+                "Can only unblock BLOCKED work item".into(),
+            ));
+        }
+        self.status = WorkItemStatus::InProgress;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DependencyType {
+    Hard,
+    Soft,
+}
+
+impl fmt::Display for DependencyType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hard => write!(f, "HARD"),
+            Self::Soft => write!(f, "SOFT"),
+        }
+    }
+}
+
+impl std::str::FromStr for DependencyType {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "HARD" => Ok(Self::Hard),
+            "SOFT" => Ok(Self::Soft),
+            other => Err(DomainError::Validation(format!(
+                "Invalid dependency type: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDependency {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub depends_on_work_item_id: String,
+    pub dependency_type: DependencyType,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AssignmentStatus {
+    Active,
+    Released,
+    Cancelled,
+}
+
+impl fmt::Display for AssignmentStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Active => write!(f, "ACTIVE"),
+            Self::Released => write!(f, "RELEASED"),
+            Self::Cancelled => write!(f, "CANCELLED"),
+        }
+    }
+}
+
+impl std::str::FromStr for AssignmentStatus {
+    type Err = DomainError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ACTIVE" => Ok(Self::Active),
+            "RELEASED" => Ok(Self::Released),
+            "CANCELLED" => Ok(Self::Cancelled),
+            other => Err(DomainError::Validation(format!(
+                "Invalid assignment status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkAssignment {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub agent_id: String,
+    pub is_primary: bool,
+    pub status: AssignmentStatus,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+pub fn would_create_cycle(existing_edges: &[(&str, &str)], from_id: &str, to_id: &str) -> bool {
+    if from_id == to_id {
+        return true;
+    }
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (u, v) in existing_edges {
+        adj.entry(u).or_default().push(v);
+    }
+    adj.entry(from_id).or_default().push(to_id);
+
+    let mut q = VecDeque::new();
+    let mut visited = HashSet::new();
+    q.push_back(to_id);
+    visited.insert(to_id);
+
+    while let Some(curr) = q.pop_front() {
+        if curr == from_id {
+            return true;
+        }
+        if let Some(nexts) = adj.get(curr) {
+            for &n in nexts {
+                if visited.insert(n) {
+                    q.push_back(n);
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

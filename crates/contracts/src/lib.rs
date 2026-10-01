@@ -374,3 +374,277 @@ pub struct CredentialListResponse {
 pub struct AgentAvailabilityResponse {
     pub availability: String,
 }
+
+fn default_priority() -> String {
+    "NORMAL".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDto {
+    pub id: String,
+    pub company_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default = "default_priority")]
+    pub priority: String,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
+    #[serde(default)]
+    pub target_outcome: Option<String>,
+    #[serde(default)]
+    pub target_date: Option<String>,
+    pub working_root_path: Option<String>,
+    pub working_root_bound_at: Option<String>,
+    pub status: String,
+    pub row_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateProjectRequest {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectListResponse {
+    pub projects: Vec<ProjectDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectLifecycleRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindProjectWorkingRootRequest {
+    pub path: String,
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnbindProjectWorkingRootRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveDto {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub parent_objective_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub is_primary: bool,
+    pub is_required: bool,
+    pub status: String,
+    pub row_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveListResponse {
+    pub objectives: Vec<ObjectiveDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateObjectiveRequest {
+    pub parent_objective_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub is_primary: bool,
+    pub is_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveLifecycleRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDto {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub is_primary: bool,
+    pub status: String,
+    pub row_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamListResponse {
+    pub teams: Vec<TeamDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTeamRequest {
+    pub name: String,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamLifecycleRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaffingRequirementDto {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub team_id: Option<String>,
+    pub role_id: String,
+    pub department_id: Option<String>,
+    pub desired_count: u32,
+    pub required_capability_ids: Vec<String>,
+    pub status: String,
+    pub row_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaffingRequirementListResponse {
+    pub staffing_requirements: Vec<StaffingRequirementDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateStaffingRequirementRequest {
+    pub team_id: Option<String>,
+    pub role_id: String,
+    pub department_id: Option<String>,
+    pub desired_count: u32,
+    pub required_capability_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaffingLifecycleRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAllocationDto {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub team_id: String,
+    pub agent_id: String,
+    pub staffing_requirement_id: Option<String>,
+    pub status: String,
+    pub row_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub released_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAllocationListResponse {
+    pub allocations: Vec<AgentAllocationDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateAgentAllocationRequest {
+    pub team_id: String,
+    pub agent_id: String,
+    pub staffing_requirement_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationLifecycleRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItemDto {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub objective_id: Option<String>,
+    pub parent_work_item_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub work_type: String,
+    pub status: String,
+    pub row_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkListResponse {
+    pub work_items: Vec<WorkItemDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateWorkItemRequest {
+    pub objective_id: Option<String>,
+    pub parent_work_item_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub work_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItemLifecycleRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDependencyDto {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub depends_on_work_item_id: String,
+    pub dependency_type: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDependencyListResponse {
+    pub dependencies: Vec<WorkDependencyDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateWorkDependencyRequest {
+    pub depends_on_work_item_id: String,
+    pub dependency_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkAssignmentDto {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub agent_id: String,
+    pub agent_allocation_id: String,
+    pub is_primary: bool,
+    pub status: String,
+    pub row_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub released_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkAssignmentListResponse {
+    pub assignments: Vec<WorkAssignmentDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateWorkAssignmentRequest {
+    pub agent_id: String,
+    pub agent_allocation_id: String,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentLifecycleRequest {
+    pub expected_version: i64,
+}

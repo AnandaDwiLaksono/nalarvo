@@ -1,5 +1,5 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use nalarvo_contracts::CreateCompanyRequest;
+use nalarvo_contracts::{CreateCompanyRequest, CreateProjectRequest, ProjectLifecycleRequest};
 
 const DEFAULT_WORKSPACE_ID: &str = "0191e4b8-0002-7000-8000-000000000001";
 
@@ -30,6 +30,67 @@ enum Commands {
     Provider(ProviderArgs),
     /// Manage agents
     Agent(AgentArgs),
+    /// Manage projects
+    Project(ProjectArgs),
+    /// Manage work
+    Work(WorkArgs),
+}
+
+#[derive(ClapArgs)]
+struct ProjectArgs {
+    #[command(subcommand)]
+    command: ProjectCommands,
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    List {
+        #[arg(long)]
+        company: String,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        company: String,
+    },
+    Create {
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    Activate {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        expected_version: i64,
+    },
+}
+
+#[derive(ClapArgs)]
+struct WorkArgs {
+    #[command(subcommand)]
+    command: WorkCommands,
+}
+
+#[derive(Subcommand)]
+enum WorkCommands {
+    List {
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(ClapArgs)]
@@ -217,6 +278,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Department:  {}", a.primary_department_id);
                 println!("Role:        {}", a.role_id);
                 println!("Version:     {}", a.row_version);
+            }
+        },
+        Commands::Project(args) => match args.command {
+            ProjectCommands::List { company } => {
+                let res =
+                    nalarvo_client::list_projects(&cli.daemon_url, &cli.token, &company).await?;
+                for p in res.projects {
+                    println!("{}\t{}\t{}\t{}", p.id, p.name, p.status, p.row_version);
+                }
+            }
+            ProjectCommands::Show { id, company } => {
+                let p =
+                    nalarvo_client::get_project(&cli.daemon_url, &cli.token, &company, &id).await?;
+                println!("{}\t{}\t{}\t{}", p.id, p.name, p.status, p.row_version);
+            }
+            ProjectCommands::Create {
+                company,
+                name,
+                description,
+            } => {
+                let p = nalarvo_client::create_project(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &CreateProjectRequest { name, description },
+                )
+                .await?;
+                println!("{}\t{}\t{}", p.id, p.name, p.status);
+            }
+            ProjectCommands::Activate {
+                id,
+                company,
+                expected_version,
+            } => {
+                let p = nalarvo_client::activate_project(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &id,
+                    &ProjectLifecycleRequest { expected_version },
+                )
+                .await?;
+                println!("{}\t{}\t{}\t{}", p.id, p.name, p.status, p.row_version);
+            }
+        },
+        Commands::Work(args) => match args.command {
+            WorkCommands::List { company, project } => {
+                let res = if let Some(proj) = project.as_deref() {
+                    nalarvo_client::list_project_work_items(
+                        &cli.daemon_url,
+                        &cli.token,
+                        &company,
+                        proj,
+                    )
+                    .await?
+                } else {
+                    nalarvo_client::list_work_items(&cli.daemon_url, &cli.token, &company).await?
+                };
+                for w in res.work_items {
+                    println!("{}\t{}\t{}", w.id, w.title, w.status);
+                }
+            }
+            WorkCommands::Show {
+                id,
+                company,
+                project,
+            } => {
+                let w = if let Some(proj) = project.as_deref() {
+                    nalarvo_client::get_project_work_item(
+                        &cli.daemon_url,
+                        &cli.token,
+                        &company,
+                        proj,
+                        &id,
+                    )
+                    .await?
+                } else {
+                    nalarvo_client::get_work_item(&cli.daemon_url, &cli.token, &company, &id)
+                        .await?
+                };
+                println!("{}\t{}\t{}", w.id, w.title, w.status);
             }
         },
     }

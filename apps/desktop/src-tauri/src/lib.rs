@@ -1,8 +1,17 @@
 use nalarvo_contracts::{
-    CompanyDto, CompanyLifecycleRequest, CompanyListResponse, CreateAgentRequest,
-    CreateCompanyRequest, CreateDepartmentRequest, CreateProviderConnectionRequest,
-    CreateRoleRequest, HealthResponse, ProviderLifecycleRequest, RoleDto, RoleListResponse,
-    SubmitCredentialRequest,
+    AgentAllocationDto, AgentAllocationListResponse, AllocationLifecycleRequest,
+    AssignmentLifecycleRequest, BindProjectWorkingRootRequest, CompanyDto, CompanyLifecycleRequest,
+    CompanyListResponse, CreateAgentAllocationRequest, CreateAgentRequest, CreateCompanyRequest,
+    CreateDepartmentRequest, CreateObjectiveRequest, CreateProjectRequest,
+    CreateProviderConnectionRequest, CreateRoleRequest, CreateStaffingRequirementRequest,
+    CreateTeamRequest, CreateWorkAssignmentRequest, CreateWorkDependencyRequest,
+    CreateWorkItemRequest, HealthResponse, ObjectiveDto, ObjectiveLifecycleRequest,
+    ObjectiveListResponse, ProjectDto, ProjectLifecycleRequest, ProjectListResponse,
+    ProviderLifecycleRequest, RoleDto, RoleListResponse, StaffingLifecycleRequest,
+    StaffingRequirementDto, StaffingRequirementListResponse, SubmitCredentialRequest, TeamDto,
+    TeamLifecycleRequest, TeamListResponse, UnbindProjectWorkingRootRequest, WorkAssignmentDto,
+    WorkAssignmentListResponse, WorkDependencyDto, WorkDependencyListResponse, WorkItemDto,
+    WorkItemLifecycleRequest, WorkListResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -321,10 +330,14 @@ async fn core_list_agents(
     let res = nalarvo_client::list_agents(&daemon_url, &token, &company_id)
         .await
         .map_err(|e| e.to_string())?;
-    let agents = res
-        .agents
-        .into_iter()
-        .map(|a| DesktopAgent {
+    let mut agents = Vec::new();
+    for a in res.agents {
+        let availability =
+            nalarvo_client::get_agent_availability(&daemon_url, &token, &company_id, &a.id)
+                .await
+                .map(|r| r.availability)
+                .ok();
+        agents.push(DesktopAgent {
             id: a.id,
             name: a.name,
             description: None,
@@ -334,10 +347,10 @@ async fn core_list_agents(
             role_id: a.role_id,
             model_profile_id: a.model_profile_id,
             max_active_allocations: a.capacity,
-            availability: Some("AVAILABLE".into()),
+            availability,
             row_version: a.row_version,
-        })
-        .collect();
+        });
+    }
     Ok(DesktopAgentListResponse { agents })
 }
 
@@ -368,9 +381,480 @@ async fn core_create_agent(
         role_id: a.role_id,
         model_profile_id: a.model_profile_id,
         max_active_allocations: a.capacity,
-        availability: Some("AVAILABLE".into()),
+        availability: None,
         row_version: a.row_version,
     })
+}
+
+#[tauri::command]
+async fn core_list_projects(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+) -> Result<ProjectListResponse, String> {
+    nalarvo_client::list_projects(&daemon_url, &token, &company_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_project(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    req: CreateProjectRequest,
+) -> Result<ProjectDto, String> {
+    nalarvo_client::create_project(&daemon_url, &token, &company_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_get_project(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+) -> Result<ProjectDto, String> {
+    nalarvo_client::get_project(&daemon_url, &token, &company_id, &project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_activate_project(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    expected_version: i64,
+) -> Result<ProjectDto, String> {
+    nalarvo_client::activate_project(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &ProjectLifecycleRequest { expected_version },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_project_lifecycle(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    req: ProjectLifecycleRequest,
+) -> Result<ProjectDto, String> {
+    nalarvo_client::activate_project(&daemon_url, &token, &company_id, &project_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_bind_project_working_root(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    req: BindProjectWorkingRootRequest,
+) -> Result<ProjectDto, String> {
+    nalarvo_client::bind_project_working_root(&daemon_url, &token, &company_id, &project_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_unbind_project_working_root(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    req: UnbindProjectWorkingRootRequest,
+) -> Result<ProjectDto, String> {
+    nalarvo_client::unbind_project_working_root(&daemon_url, &token, &company_id, &project_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_objectives(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+) -> Result<ObjectiveListResponse, String> {
+    nalarvo_client::list_objectives(&daemon_url, &token, &company_id, &project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_objective(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    req: CreateObjectiveRequest,
+) -> Result<ObjectiveDto, String> {
+    nalarvo_client::create_objective(&daemon_url, &token, &company_id, &project_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_objective_lifecycle(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    objective_id: String,
+    req: ObjectiveLifecycleRequest,
+) -> Result<ObjectiveDto, String> {
+    nalarvo_client::activate_objective(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &objective_id,
+        &req,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_teams(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+) -> Result<TeamListResponse, String> {
+    nalarvo_client::list_teams(&daemon_url, &token, &company_id, &project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_team(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    req: CreateTeamRequest,
+) -> Result<TeamDto, String> {
+    nalarvo_client::create_team(&daemon_url, &token, &company_id, &project_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_team_lifecycle(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    team_id: String,
+    req: TeamLifecycleRequest,
+) -> Result<TeamDto, String> {
+    nalarvo_client::team_lifecycle(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &team_id,
+        "activate",
+        &req,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_staffing_requirements(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+) -> Result<StaffingRequirementListResponse, String> {
+    nalarvo_client::list_staffing_requirements(&daemon_url, &token, &company_id, &project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_staffing_requirement(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    req: CreateStaffingRequirementRequest,
+) -> Result<StaffingRequirementDto, String> {
+    nalarvo_client::create_staffing_requirement(&daemon_url, &token, &company_id, &project_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_staffing_lifecycle(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    requirement_id: String,
+    req: StaffingLifecycleRequest,
+) -> Result<StaffingRequirementDto, String> {
+    nalarvo_client::staffing_requirement_lifecycle(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &requirement_id,
+        "open",
+        &req,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_allocations(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+) -> Result<AgentAllocationListResponse, String> {
+    nalarvo_client::list_agent_allocations(&daemon_url, &token, &company_id, &project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_allocation(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    req: CreateAgentAllocationRequest,
+) -> Result<AgentAllocationDto, String> {
+    nalarvo_client::create_agent_allocation(&daemon_url, &token, &company_id, &project_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_allocation_lifecycle(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    allocation_id: String,
+    req: AllocationLifecycleRequest,
+) -> Result<AgentAllocationDto, String> {
+    nalarvo_client::agent_allocation_lifecycle(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &allocation_id,
+        "activate",
+        &req,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_work_items(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: Option<String>,
+) -> Result<WorkListResponse, String> {
+    if let Some(project_id) = project_id {
+        nalarvo_client::list_project_work_items(&daemon_url, &token, &company_id, &project_id)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        nalarvo_client::list_work_items(&daemon_url, &token, &company_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+async fn core_create_work_item(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    req: CreateWorkItemRequest,
+) -> Result<WorkItemDto, String> {
+    nalarvo_client::create_work_item(&daemon_url, &token, &company_id, &project_id, &req)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_get_work_item(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: Option<String>,
+    work_id: String,
+) -> Result<WorkItemDto, String> {
+    if let Some(project_id) = project_id {
+        nalarvo_client::get_project_work_item(
+            &daemon_url,
+            &token,
+            &company_id,
+            &project_id,
+            &work_id,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    } else {
+        nalarvo_client::get_work_item(&daemon_url, &token, &company_id, &work_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+async fn core_work_lifecycle(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    work_id: String,
+    req: WorkItemLifecycleRequest,
+) -> Result<WorkItemDto, String> {
+    nalarvo_client::work_item_lifecycle(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &work_id,
+        "start",
+        &req,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_dependencies(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    work_id: String,
+) -> Result<WorkDependencyListResponse, String> {
+    nalarvo_client::list_work_dependencies(&daemon_url, &token, &company_id, &project_id, &work_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_dependency(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    work_id: String,
+    req: CreateWorkDependencyRequest,
+) -> Result<WorkDependencyDto, String> {
+    nalarvo_client::create_work_dependency(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &work_id,
+        &req,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_delete_dependency(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    work_id: String,
+    dependency_id: String,
+) -> Result<(), String> {
+    nalarvo_client::delete_work_dependency(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &work_id,
+        &dependency_id,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_assignments(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    work_id: String,
+) -> Result<WorkAssignmentListResponse, String> {
+    nalarvo_client::list_work_assignments(&daemon_url, &token, &company_id, &project_id, &work_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_assignment(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    work_id: String,
+    req: CreateWorkAssignmentRequest,
+) -> Result<WorkAssignmentDto, String> {
+    nalarvo_client::create_work_assignment(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &work_id,
+        &req,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_assignment_lifecycle(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    work_id: String,
+    assignment_id: String,
+    req: AssignmentLifecycleRequest,
+) -> Result<WorkAssignmentDto, String> {
+    nalarvo_client::work_assignment_lifecycle(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &work_id,
+        &assignment_id,
+        "release",
+        &req,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 struct DaemonChild(Mutex<Option<Child>>);
@@ -458,7 +942,36 @@ pub fn run() {
             core_list_roles,
             core_create_role,
             core_list_agents,
-            core_create_agent
+            core_create_agent,
+            core_list_projects,
+            core_create_project,
+            core_get_project,
+            core_activate_project,
+            core_project_lifecycle,
+            core_bind_project_working_root,
+            core_unbind_project_working_root,
+            core_list_objectives,
+            core_create_objective,
+            core_objective_lifecycle,
+            core_list_teams,
+            core_create_team,
+            core_team_lifecycle,
+            core_list_staffing_requirements,
+            core_create_staffing_requirement,
+            core_staffing_lifecycle,
+            core_list_allocations,
+            core_create_allocation,
+            core_allocation_lifecycle,
+            core_list_work_items,
+            core_create_work_item,
+            core_get_work_item,
+            core_work_lifecycle,
+            core_list_dependencies,
+            core_create_dependency,
+            core_delete_dependency,
+            core_list_assignments,
+            core_create_assignment,
+            core_assignment_lifecycle
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nalarvo desktop");
