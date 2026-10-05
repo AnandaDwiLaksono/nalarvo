@@ -336,14 +336,14 @@ async fn test_proof_department_immutability_and_work_item_not_run() {
         .await;
     assert!(dept_mod.is_err());
 
-    // Prove WorkItem != Run: verify runs table does NOT exist in sqlite schema
-    let runs_check =
-        sqlx::query("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='runs'")
+    // Prove M4/M5 boundary: verify M5 actions table does NOT exist in M4
+    let actions_check =
+        sqlx::query("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='actions'")
             .fetch_one(pool)
             .await
             .unwrap();
-    let count: i64 = sqlx::Row::get(&runs_check, 0);
-    assert_eq!(count, 0, "M4 runs table must NOT exist in M3!");
+    let count: i64 = sqlx::Row::get(&actions_check, 0);
+    assert_eq!(count, 0, "M5 actions table must NOT exist in M4!");
 }
 
 #[tokio::test]

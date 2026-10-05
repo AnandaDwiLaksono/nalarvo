@@ -84,7 +84,15 @@ type WorkAssignment = {
   is_primary: boolean;
   row_version: number;
 };
-type Tab = "Departments" | "Roles" | "Agents" | "Projects" | "Work";
+type Run = {
+  id: string;
+  work_item_id: string;
+  executing_agent_id: string;
+  lifecycle_state: string;
+  attempt_number: number;
+  created_at: string;
+};
+type Tab = "Departments" | "Roles" | "Agents" | "Projects" | "Work" | "Runs";
 
 const DEFAULT_WORKSPACE_ID = "0191e4b8-0002-7000-8000-000000000001";
 
@@ -100,6 +108,7 @@ export default function App() {
   const [workItems, setWorkItems] = useState<WorkItem[]>([]);
   const [dependencies, setDependencies] = useState<WorkDependency[]>([]);
   const [assignments, setAssignments] = useState<WorkAssignment[]>([]);
+  const [runs, setRuns] = useState<Run[]>([]);
   const [selectedCompany, setSelectedCompany] = useState("");
   const [selectedAgent, setSelectedAgent] = useState("");
   const [selectedProject, setSelectedProject] = useState("");
@@ -221,6 +230,18 @@ export default function App() {
     setAssignments(assignRes.assignments);
   };
 
+  const loadRuns = async (companyId: string, projectId: string) => {
+    if (!companyId || !projectId) {
+      setRuns([]);
+      return;
+    }
+    const result = await invoke<{ runs: Run[] }>("core_list_runs", {
+      companyId,
+      projectId,
+    });
+    setRuns(result.runs);
+  };
+
   useEffect(() => {
     void (async () => {
       try {
@@ -250,6 +271,9 @@ export default function App() {
     if (!selectedCompany || !selectedProject) return;
     void loadWorkItems(selectedCompany, selectedProject).catch(() => {
       setError("Work could not be loaded.");
+    });
+    void loadRuns(selectedCompany, selectedProject).catch(() => {
+      // safe ignore
     });
   }, [selectedCompany, selectedProject]);
 
@@ -546,6 +570,7 @@ export default function App() {
                     "Agents",
                     "Projects",
                     "Work",
+                    "Runs",
                   ] as const
                 ).map((view) => (
                   <button
@@ -1124,6 +1149,68 @@ export default function App() {
                       </div>
                     </article>
                   )}
+                </section>
+              )}
+              {tab === "Runs" && activeProject && (
+                <section aria-labelledby="runs-title">
+                  <h3 id="runs-title">Runs · {activeProject.name}</h3>
+                  <ul>
+                    {runs.map((run) => (
+                      <li key={run.id}>
+                        Run {run.id} · WorkItem {run.work_item_id} · Agent{" "}
+                        {run.executing_agent_id} · State: {run.lifecycle_state}{" "}
+                        (Attempt #{run.attempt_number})
+                        {run.lifecycle_state === "QUEUED" && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              void mutate(async () => {
+                                await invoke("core_queue_run", {
+                                  companyId: activeCompany.id,
+                                  projectId: activeProject.id,
+                                  runId: run.id,
+                                  payload: { expected_version: 1 },
+                                });
+                                await loadRuns(
+                                  activeCompany.id,
+                                  activeProject.id,
+                                );
+                              })
+                            }
+                          >
+                            Queue Run
+                          </button>
+                        )}
+                        {(run.lifecycle_state === "QUEUED" ||
+                          run.lifecycle_state === "RUNNING") && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              void mutate(async () => {
+                                await invoke("core_cancel_run", {
+                                  companyId: activeCompany.id,
+                                  projectId: activeProject.id,
+                                  runId: run.id,
+                                  payload: {
+                                    expected_version: 1,
+                                    reason: "Cancelled via Desktop",
+                                  },
+                                });
+                                await loadRuns(
+                                  activeCompany.id,
+                                  activeProject.id,
+                                );
+                              })
+                            }
+                          >
+                            Cancel Run
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
                 </section>
               )}
             </section>

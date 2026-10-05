@@ -5,6 +5,8 @@ members = [
     "crates/application",
     "crates/secret-store-windows",
     "crates/contracts",
+    "crates/model-gateway",
+    "crates/runtime",
     "crates/local-api",
     "crates/client",
     "crates/daemon",

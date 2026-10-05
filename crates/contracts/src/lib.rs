@@ -648,3 +648,302 @@ pub struct CreateWorkAssignmentRequest {
 pub struct AssignmentLifecycleRequest {
     pub expected_version: i64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDto {
+    pub id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub assignment_id: Option<String>,
+    pub executing_agent_id: String,
+    pub lifecycle_state: String,
+    pub trigger_type: String,
+    pub attempt_number: i64,
+    pub retry_of_run_id: Option<String>,
+    pub model_profile_version_id: Option<String>,
+    pub requested_by_type: String,
+    pub requested_by_id: String,
+    pub queued_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub row_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateRunRequest {
+    pub work_item_id: String,
+    pub assignment_id: Option<String>,
+    pub executing_agent_id: String,
+    pub trigger_type: String,
+    pub retry_of_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunListResponse {
+    pub runs: Vec<RunDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunShowResponse {
+    pub run: RunDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueRunRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PauseRunRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeRunRequest {
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelRunRequest {
+    pub expected_version: i64,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandAcceptedResponse {
+    pub run_id: String,
+    pub command: String,
+    pub accepted_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionStepDto {
+    pub id: String,
+    pub company_id: String,
+    pub run_id: String,
+    pub sequence_no: i64,
+    pub step_type: String,
+    pub lifecycle_state: String,
+    pub parent_step_id: Option<String>,
+    pub input_metadata: Option<serde_json::Value>,
+    pub output_metadata: Option<serde_json::Value>,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionStepListResponse {
+    pub steps: Vec<ExecutionStepDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeResultDto {
+    pub id: String,
+    pub company_id: String,
+    pub run_id: String,
+    pub run_status: String,
+    pub result_summary: String,
+    pub output_payload: Option<serde_json::Value>,
+    pub output_metadata: Option<serde_json::Value>,
+    pub resource_usage_summary: Option<serde_json::Value>,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub warnings: Vec<String>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeResultResponse {
+    pub result: RuntimeResultDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageRecordDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub agent_id: String,
+    pub run_id: String,
+    pub step_id: Option<String>,
+    pub provider_connection_id: String,
+    pub model_id: String,
+    pub usage_type: String,
+    pub quantity: i64,
+    pub unit: String,
+    pub estimated_cost: Option<f64>,
+    pub occurred_at: String,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageRecordListResponse {
+    pub usage_records: Vec<UsageRecordDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineEventDto {
+    pub event_id: String,
+    pub run_id: String,
+    pub sequence_no: i64,
+    pub event_type: String,
+    pub occurred_at: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimelineResponse {
+    pub events: Vec<TimelineEventDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    tag = "event_type",
+    rename_all = "SCREAMING_SNAKE_CASE"
+)]
+pub enum NormalizedModelEvent {
+    Started {
+        run_id: String,
+        step_id: String,
+        invocation_index: i64,
+    },
+    OutputDelta {
+        run_id: String,
+        step_id: String,
+        text: String,
+    },
+    Usage {
+        run_id: String,
+        step_id: String,
+        input_tokens: i64,
+        output_tokens: i64,
+    },
+    Completed {
+        run_id: String,
+        step_id: String,
+        finish_reason: String,
+    },
+    Failed {
+        run_id: String,
+        step_id: String,
+        failure_class: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerExecutionRequest {
+    pub run_id: String,
+    pub company_id: String,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub executing_agent_id: String,
+    pub model_profile_version_id: Option<String>,
+    pub correlation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLeaseRequest {
+    pub run_id: String,
+    pub worker_principal_id: String,
+    pub lease_duration_seconds: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLeaseResponse {
+    pub lease_id: String,
+    pub run_id: String,
+    pub lease_version: i64,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerHeartbeatRequest {
+    pub run_id: String,
+    pub lease_id: String,
+    pub lease_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerStepRequest {
+    pub run_id: String,
+    pub lease_id: String,
+    pub lease_version: i64,
+    pub sequence_no: i64,
+    pub step_type: String,
+    pub lifecycle_state: String,
+    pub parent_step_id: Option<String>,
+    pub input_metadata: Option<serde_json::Value>,
+    pub output_metadata: Option<serde_json::Value>,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCheckpointRequest {
+    pub run_id: String,
+    pub lease_id: String,
+    pub lease_version: i64,
+    pub checkpoint_version: i64,
+    pub run_state: String,
+    pub last_completed_step: Option<i64>,
+    pub active_step: Option<i64>,
+    pub execution_phase: String,
+    pub context_refs: Vec<String>,
+    pub continuation_metadata: Option<serde_json::Value>,
+    pub usage_snapshot: Option<serde_json::Value>,
+    pub safe_to_resume: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerResultRequest {
+    pub run_id: String,
+    pub lease_id: String,
+    pub lease_version: i64,
+    pub run_status: String,
+    pub result_summary: String,
+    pub output_payload: Option<serde_json::Value>,
+    pub output_metadata: Option<serde_json::Value>,
+    pub resource_usage_summary: Option<serde_json::Value>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerTerminalRequest {
+    pub run_id: String,
+    pub lease_id: String,
+    pub lease_version: i64,
+    pub lifecycle_state: String,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub completed_at: String,
+}

@@ -1,5 +1,8 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use nalarvo_contracts::{CreateCompanyRequest, CreateProjectRequest, ProjectLifecycleRequest};
+use nalarvo_contracts::{
+    CancelRunRequest, CreateCompanyRequest, CreateProjectRequest, CreateRunRequest,
+    ProjectLifecycleRequest, QueueRunRequest,
+};
 
 const DEFAULT_WORKSPACE_ID: &str = "0191e4b8-0002-7000-8000-000000000001";
 
@@ -34,6 +37,91 @@ enum Commands {
     Project(ProjectArgs),
     /// Manage work
     Work(WorkArgs),
+    /// Manage runs
+    Run(RunArgs),
+}
+
+#[derive(ClapArgs)]
+struct RunArgs {
+    #[command(subcommand)]
+    command: RunCommands,
+}
+
+#[derive(Subcommand)]
+enum RunCommands {
+    List {
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+    },
+    Create {
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        work_item: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long, default_value = "MANUAL")]
+        trigger: String,
+        #[arg(long)]
+        assignment: Option<String>,
+    },
+    Queue {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value_t = 1)]
+        expected_version: i64,
+    },
+    Cancel {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Steps {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+    },
+    Timeline {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+    },
+    Result {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+    },
+    Usage {
+        id: String,
+        #[arg(long)]
+        company: String,
+        #[arg(long)]
+        project: String,
+    },
 }
 
 #[derive(ClapArgs)]
@@ -359,6 +447,175 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await?
                 };
                 println!("{}\t{}\t{}", w.id, w.title, w.status);
+            }
+        },
+        Commands::Run(args) => match args.command {
+            RunCommands::List { company, project } => {
+                let res =
+                    nalarvo_client::list_runs(&cli.daemon_url, &cli.token, &company, &project)
+                        .await?;
+                for r in res.runs {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        r.id,
+                        r.work_item_id,
+                        r.executing_agent_id,
+                        r.lifecycle_state,
+                        r.attempt_number
+                    );
+                }
+            }
+            RunCommands::Show {
+                id,
+                company,
+                project,
+            } => {
+                let r =
+                    nalarvo_client::get_run(&cli.daemon_url, &cli.token, &company, &project, &id)
+                        .await?;
+                println!("ID:           {}", r.run.id);
+                println!("WorkItem:     {}", r.run.work_item_id);
+                println!("Agent:        {}", r.run.executing_agent_id);
+                println!("Status:       {}", r.run.lifecycle_state);
+                println!("Attempt:      {}", r.run.attempt_number);
+                println!("Created:      {}", r.run.created_at);
+            }
+            RunCommands::Create {
+                company,
+                project,
+                work_item,
+                agent,
+                trigger,
+                assignment,
+            } => {
+                let req = CreateRunRequest {
+                    work_item_id: work_item,
+                    executing_agent_id: agent,
+                    trigger_type: trigger,
+                    assignment_id: assignment,
+                    retry_of_run_id: None,
+                };
+                let r = nalarvo_client::create_run(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &project,
+                    &req,
+                )
+                .await?;
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    r.id, r.work_item_id, r.lifecycle_state, r.attempt_number
+                );
+            }
+            RunCommands::Queue {
+                id,
+                company,
+                project,
+                expected_version,
+            } => {
+                let req = QueueRunRequest { expected_version };
+                let res = nalarvo_client::queue_run(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &project,
+                    &id,
+                    &req,
+                )
+                .await?;
+                println!("{}\t{}\t{}", res.run_id, res.command, res.accepted_at);
+            }
+            RunCommands::Cancel {
+                id,
+                company,
+                project,
+                reason,
+            } => {
+                let req = CancelRunRequest {
+                    expected_version: 1,
+                    reason,
+                };
+                let res = nalarvo_client::cancel_run(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &project,
+                    &id,
+                    &req,
+                )
+                .await?;
+                println!("{}\t{}\t{}", res.run_id, res.command, res.accepted_at);
+            }
+            RunCommands::Steps {
+                id,
+                company,
+                project,
+            } => {
+                let res = nalarvo_client::list_execution_steps(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &project,
+                    &id,
+                )
+                .await?;
+                for s in res.steps {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        s.sequence_no, s.step_type, s.lifecycle_state, s.created_at
+                    );
+                }
+            }
+            RunCommands::Timeline {
+                id,
+                company,
+                project,
+            } => {
+                let res = nalarvo_client::get_run_timeline(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &project,
+                    &id,
+                )
+                .await?;
+                for e in res.events {
+                    println!("{}\t{}\t{}", e.sequence_no, e.event_type, e.occurred_at);
+                }
+            }
+            RunCommands::Result {
+                id,
+                company,
+                project,
+            } => {
+                let res = nalarvo_client::get_runtime_result(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &project,
+                    &id,
+                )
+                .await?;
+                println!("Status:  {}", res.result.run_status);
+                println!("Summary: {}", res.result.result_summary);
+            }
+            RunCommands::Usage {
+                id,
+                company,
+                project,
+            } => {
+                let res = nalarvo_client::list_usage_records(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company,
+                    &project,
+                    &id,
+                )
+                .await?;
+                for u in res.usage_records {
+                    println!("{}\t{}\t{}", u.model_id, u.quantity, u.unit);
+                }
             }
         },
     }

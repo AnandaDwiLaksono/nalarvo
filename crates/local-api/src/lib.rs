@@ -42,6 +42,8 @@ use nalarvo_domain::{
 
 use std::{convert::Infallible, sync::Arc};
 use tokio_stream::StreamExt;
+
+pub mod m4;
 use tokio_stream::wrappers::BroadcastStream;
 
 #[derive(Clone)]
@@ -192,6 +194,7 @@ pub fn router_with_app(token: impl Into<Arc<str>>, app_ctx: Option<ApplicationCo
             get(get_work_item),
         )
         .route("/api/v1/events", get(events_sse))
+        .merge(m4::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,

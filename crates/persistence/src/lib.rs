@@ -15,6 +15,8 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod m4;
+
 #[derive(Debug, Error)]
 pub enum PersistenceError {
     #[error("Database error: {0}")]

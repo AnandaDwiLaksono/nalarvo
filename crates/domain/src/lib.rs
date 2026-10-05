@@ -2034,6 +2034,479 @@ pub fn would_create_cycle(existing_edges: &[(&str, &str)], from_id: &str, to_id:
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RunStatus {
+    Queued,
+    Running,
+    Paused,
+    WaitingApproval,
+    WaitingDependency,
+    Succeeded,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl RunStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::TimedOut | Self::Cancelled
+        )
+    }
+}
+
+impl fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Queued => "QUEUED",
+            Self::Running => "RUNNING",
+            Self::Paused => "PAUSED",
+            Self::WaitingApproval => "WAITING_APPROVAL",
+            Self::WaitingDependency => "WAITING_DEPENDENCY",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+            Self::TimedOut => "TIMED_OUT",
+            Self::Cancelled => "CANCELLED",
+        };
+        f.write_str(value)
+    }
+}
+
+impl std::str::FromStr for RunStatus {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "QUEUED" => Ok(Self::Queued),
+            "RUNNING" => Ok(Self::Running),
+            "PAUSED" => Ok(Self::Paused),
+            "WAITING_APPROVAL" => Ok(Self::WaitingApproval),
+            "WAITING_DEPENDENCY" => Ok(Self::WaitingDependency),
+            "SUCCEEDED" => Ok(Self::Succeeded),
+            "FAILED" => Ok(Self::Failed),
+            "TIMED_OUT" => Ok(Self::TimedOut),
+            "CANCELLED" => Ok(Self::Cancelled),
+            other => Err(DomainError::Validation(format!(
+                "Invalid run status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Run {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub project_id: String,
+    pub work_item_id: String,
+    pub assignment_id: Option<String>,
+    pub executing_agent_id: String,
+    pub status: RunStatus,
+    pub trigger_type: String,
+    pub attempt_number: u32,
+    pub retry_of_run_id: Option<String>,
+    pub model_profile_version_id: Option<String>,
+    pub requested_by: PrincipalRef,
+    pub queued_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub row_version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Run {
+    pub fn create(
+        company_id: CompanyId,
+        project_id: String,
+        work_item_id: String,
+        executing_agent_id: String,
+        trigger_type: String,
+        requested_by: PrincipalRef,
+        correlation_id: String,
+    ) -> Result<Self, DomainError> {
+        if company_id.0.trim().is_empty() || requested_by.principal_id.trim().is_empty() {
+            return Err(DomainError::Validation(
+                "Run company and requester cannot be empty".into(),
+            ));
+        }
+        let now = Utc::now();
+        Ok(Self {
+            id: Uuid::now_v7().to_string(),
+            company_id,
+            project_id: required("Run project", project_id)?,
+            work_item_id: required("Run work item", work_item_id)?,
+            assignment_id: None,
+            executing_agent_id: required("Run executing agent", executing_agent_id)?,
+            status: RunStatus::Queued,
+            trigger_type: required("Run trigger type", trigger_type)?,
+            attempt_number: 1,
+            retry_of_run_id: None,
+            model_profile_version_id: None,
+            requested_by,
+            queued_at: now,
+            started_at: None,
+            completed_at: None,
+            failure_class: None,
+            failure_detail: None,
+            correlation_id: required("Run correlation", correlation_id)?,
+            causation_id: None,
+            row_version: 1,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn start(&mut self) -> Result<(), DomainError> {
+        self.transition(RunStatus::Queued, RunStatus::Running)?;
+        self.started_at = Some(self.updated_at);
+        Ok(())
+    }
+
+    pub fn pause(&mut self) -> Result<(), DomainError> {
+        self.transition(RunStatus::Running, RunStatus::Paused)
+    }
+
+    pub fn wait_for_approval(&mut self) -> Result<(), DomainError> {
+        self.transition(RunStatus::Running, RunStatus::WaitingApproval)
+    }
+
+    pub fn wait_for_dependency(&mut self) -> Result<(), DomainError> {
+        self.transition(RunStatus::Running, RunStatus::WaitingDependency)
+    }
+
+    pub fn resume(&mut self) -> Result<(), DomainError> {
+        if !matches!(
+            self.status,
+            RunStatus::Paused | RunStatus::WaitingApproval | RunStatus::WaitingDependency
+        ) {
+            return Err(DomainError::Validation(
+                "Only paused or waiting runs can resume".into(),
+            ));
+        }
+        self.status = RunStatus::Running;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn cancel(&mut self) -> Result<(), DomainError> {
+        if !matches!(
+            self.status,
+            RunStatus::Queued
+                | RunStatus::Running
+                | RunStatus::Paused
+                | RunStatus::WaitingApproval
+                | RunStatus::WaitingDependency
+        ) {
+            return Err(DomainError::Validation("Cannot cancel terminal run".into()));
+        }
+        self.status = RunStatus::Cancelled;
+        self.finish();
+        Ok(())
+    }
+
+    pub fn succeed(&mut self) -> Result<(), DomainError> {
+        self.terminal(RunStatus::Succeeded, None, None)
+    }
+
+    pub fn fail(
+        &mut self,
+        failure_class: String,
+        failure_detail: String,
+    ) -> Result<(), DomainError> {
+        self.terminal(
+            RunStatus::Failed,
+            Some(required("Run failure class", failure_class)?),
+            Some(required("Run failure detail", failure_detail)?),
+        )
+    }
+
+    pub fn reject_admission(
+        &mut self,
+        failure_class: String,
+        failure_detail: String,
+    ) -> Result<(), DomainError> {
+        if self.status != RunStatus::Queued {
+            return Err(DomainError::Validation(
+                "Only queued runs can be rejected at admission".into(),
+            ));
+        }
+        self.failure_class = Some(required("Run failure class", failure_class)?);
+        self.failure_detail = Some(required("Run failure detail", failure_detail)?);
+        self.status = RunStatus::Failed;
+        self.finish();
+        Ok(())
+    }
+
+    pub fn time_out(
+        &mut self,
+        failure_class: String,
+        failure_detail: String,
+    ) -> Result<(), DomainError> {
+        self.terminal(
+            RunStatus::TimedOut,
+            Some(required("Run timeout class", failure_class)?),
+            Some(required("Run timeout detail", failure_detail)?),
+        )
+    }
+
+    pub fn retry(&self) -> Result<Self, DomainError> {
+        if !matches!(self.status, RunStatus::Failed | RunStatus::TimedOut) {
+            return Err(DomainError::Validation(
+                "Only failed or timed out runs can be retried".into(),
+            ));
+        }
+        let now = Utc::now();
+        Ok(Self {
+            id: Uuid::now_v7().to_string(),
+            company_id: self.company_id.clone(),
+            project_id: self.project_id.clone(),
+            work_item_id: self.work_item_id.clone(),
+            assignment_id: self.assignment_id.clone(),
+            executing_agent_id: self.executing_agent_id.clone(),
+            status: RunStatus::Queued,
+            trigger_type: self.trigger_type.clone(),
+            attempt_number: self
+                .attempt_number
+                .checked_add(1)
+                .ok_or_else(|| DomainError::Validation("Run attempt number overflow".into()))?,
+            retry_of_run_id: Some(self.id.clone()),
+            model_profile_version_id: self.model_profile_version_id.clone(),
+            requested_by: self.requested_by.clone(),
+            queued_at: now,
+            started_at: None,
+            completed_at: None,
+            failure_class: None,
+            failure_detail: None,
+            correlation_id: self.correlation_id.clone(),
+            causation_id: Some(self.id.clone()),
+            row_version: 1,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    fn terminal(
+        &mut self,
+        status: RunStatus,
+        failure_class: Option<String>,
+        failure_detail: Option<String>,
+    ) -> Result<(), DomainError> {
+        if self.status != RunStatus::Running {
+            return Err(DomainError::Validation(
+                "Only running runs can reach a terminal outcome".into(),
+            ));
+        }
+        self.status = status;
+        self.failure_class = failure_class;
+        self.failure_detail = failure_detail;
+        self.finish();
+        Ok(())
+    }
+
+    fn transition(&mut self, from: RunStatus, to: RunStatus) -> Result<(), DomainError> {
+        if self.status != from {
+            return Err(DomainError::Validation(
+                "Invalid run lifecycle transition".into(),
+            ));
+        }
+        self.status = to;
+        self.row_version += 1;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        let now = Utc::now();
+        self.completed_at = Some(now);
+        self.row_version += 1;
+        self.updated_at = now;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExecutionStepStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+impl ExecutionStepStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Skipped
+        )
+    }
+}
+
+impl fmt::Display for ExecutionStepStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Pending => "PENDING",
+            Self::Running => "RUNNING",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+            Self::Cancelled => "CANCELLED",
+            Self::Skipped => "SKIPPED",
+        };
+        f.write_str(value)
+    }
+}
+
+impl std::str::FromStr for ExecutionStepStatus {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "RUNNING" => Ok(Self::Running),
+            "SUCCEEDED" => Ok(Self::Succeeded),
+            "FAILED" => Ok(Self::Failed),
+            "CANCELLED" => Ok(Self::Cancelled),
+            "SKIPPED" => Ok(Self::Skipped),
+            other => Err(DomainError::Validation(format!(
+                "Invalid execution step status: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStep {
+    pub id: String,
+    pub company_id: CompanyId,
+    pub run_id: String,
+    pub sequence_no: u32,
+    pub step_type: String,
+    pub status: ExecutionStepStatus,
+    pub parent_step_id: Option<String>,
+    pub input_metadata: Option<serde_json::Value>,
+    pub output_metadata: Option<serde_json::Value>,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ExecutionStep {
+    pub fn create(
+        company_id: CompanyId,
+        run_id: String,
+        sequence_no: u32,
+        step_type: String,
+    ) -> Result<Self, DomainError> {
+        if company_id.0.trim().is_empty() || sequence_no == 0 {
+            return Err(DomainError::Validation(
+                "Execution step company and sequence must be valid".into(),
+            ));
+        }
+        Ok(Self {
+            id: Uuid::now_v7().to_string(),
+            company_id,
+            run_id: required("Execution step run", run_id)?,
+            sequence_no,
+            step_type: required("Execution step type", step_type)?,
+            status: ExecutionStepStatus::Pending,
+            parent_step_id: None,
+            input_metadata: None,
+            output_metadata: None,
+            failure_class: None,
+            failure_detail: None,
+            started_at: None,
+            completed_at: None,
+            created_at: Utc::now(),
+        })
+    }
+
+    pub fn start(&mut self) -> Result<(), DomainError> {
+        if self.status != ExecutionStepStatus::Pending {
+            return Err(DomainError::Validation(
+                "Can only start pending execution step".into(),
+            ));
+        }
+        self.status = ExecutionStepStatus::Running;
+        self.started_at = Some(Utc::now());
+        Ok(())
+    }
+
+    pub fn succeed(&mut self, output_metadata: serde_json::Value) -> Result<(), DomainError> {
+        self.finish(
+            ExecutionStepStatus::Succeeded,
+            Some(output_metadata),
+            None,
+            None,
+        )
+    }
+
+    pub fn fail(
+        &mut self,
+        failure_class: String,
+        failure_detail: String,
+    ) -> Result<(), DomainError> {
+        self.finish(
+            ExecutionStepStatus::Failed,
+            None,
+            Some(required("Execution step failure class", failure_class)?),
+            Some(required("Execution step failure detail", failure_detail)?),
+        )
+    }
+
+    pub fn cancel(&mut self) -> Result<(), DomainError> {
+        if self.status.is_terminal() {
+            return Err(DomainError::Validation(
+                "Cannot cancel terminal execution step".into(),
+            ));
+        }
+        self.status = ExecutionStepStatus::Cancelled;
+        self.completed_at = Some(Utc::now());
+        Ok(())
+    }
+
+    pub fn skip(&mut self) -> Result<(), DomainError> {
+        if self.status != ExecutionStepStatus::Pending {
+            return Err(DomainError::Validation(
+                "Only pending execution steps can be skipped".into(),
+            ));
+        }
+        self.status = ExecutionStepStatus::Skipped;
+        self.completed_at = Some(Utc::now());
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        status: ExecutionStepStatus,
+        output_metadata: Option<serde_json::Value>,
+        failure_class: Option<String>,
+        failure_detail: Option<String>,
+    ) -> Result<(), DomainError> {
+        if self.status != ExecutionStepStatus::Running {
+            return Err(DomainError::Validation(
+                "Only running execution steps can finish".into(),
+            ));
+        }
+        self.status = status;
+        self.output_metadata = output_metadata;
+        self.failure_class = failure_class;
+        self.failure_detail = failure_detail;
+        self.completed_at = Some(Utc::now());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

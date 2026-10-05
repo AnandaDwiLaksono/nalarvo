@@ -1,15 +1,18 @@
 use nalarvo_contracts::{
     AgentAllocationDto, AgentAllocationListResponse, AllocationLifecycleRequest,
-    AssignmentLifecycleRequest, BindProjectWorkingRootRequest, CompanyDto, CompanyLifecycleRequest,
-    CompanyListResponse, CreateAgentAllocationRequest, CreateAgentRequest, CreateCompanyRequest,
+    AssignmentLifecycleRequest, BindProjectWorkingRootRequest, CancelRunRequest,
+    CommandAcceptedResponse, CompanyDto, CompanyLifecycleRequest, CompanyListResponse,
+    CreateAgentAllocationRequest, CreateAgentRequest, CreateCompanyRequest,
     CreateDepartmentRequest, CreateObjectiveRequest, CreateProjectRequest,
-    CreateProviderConnectionRequest, CreateRoleRequest, CreateStaffingRequirementRequest,
-    CreateTeamRequest, CreateWorkAssignmentRequest, CreateWorkDependencyRequest,
-    CreateWorkItemRequest, HealthResponse, ObjectiveDto, ObjectiveLifecycleRequest,
-    ObjectiveListResponse, ProjectDto, ProjectLifecycleRequest, ProjectListResponse,
-    ProviderLifecycleRequest, RoleDto, RoleListResponse, StaffingLifecycleRequest,
-    StaffingRequirementDto, StaffingRequirementListResponse, SubmitCredentialRequest, TeamDto,
-    TeamLifecycleRequest, TeamListResponse, UnbindProjectWorkingRootRequest, WorkAssignmentDto,
+    CreateProviderConnectionRequest, CreateRoleRequest, CreateRunRequest,
+    CreateStaffingRequirementRequest, CreateTeamRequest, CreateWorkAssignmentRequest,
+    CreateWorkDependencyRequest, CreateWorkItemRequest, ExecutionStepListResponse, HealthResponse,
+    ObjectiveDto, ObjectiveLifecycleRequest, ObjectiveListResponse, ProjectDto,
+    ProjectLifecycleRequest, ProjectListResponse, ProviderLifecycleRequest, QueueRunRequest,
+    RoleDto, RoleListResponse, RunDto, RunListResponse, RunShowResponse, RuntimeResultResponse,
+    StaffingLifecycleRequest, StaffingRequirementDto, StaffingRequirementListResponse,
+    SubmitCredentialRequest, TeamDto, TeamLifecycleRequest, TeamListResponse, TimelineResponse,
+    UnbindProjectWorkingRootRequest, UsageRecordListResponse, WorkAssignmentDto,
     WorkAssignmentListResponse, WorkDependencyDto, WorkDependencyListResponse, WorkItemDto,
     WorkItemLifecycleRequest, WorkListResponse,
 };
@@ -870,6 +873,138 @@ impl Drop for DaemonChild {
     }
 }
 
+#[tauri::command]
+async fn core_list_runs(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+) -> Result<RunListResponse, String> {
+    nalarvo_client::list_runs(&daemon_url, &token, &company_id, &project_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_get_run(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    run_id: String,
+) -> Result<RunShowResponse, String> {
+    nalarvo_client::get_run(&daemon_url, &token, &company_id, &project_id, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_create_run(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    payload: CreateRunRequest,
+) -> Result<RunDto, String> {
+    nalarvo_client::create_run(&daemon_url, &token, &company_id, &project_id, &payload)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_queue_run(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    run_id: String,
+    payload: QueueRunRequest,
+) -> Result<CommandAcceptedResponse, String> {
+    nalarvo_client::queue_run(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &run_id,
+        &payload,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_cancel_run(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    run_id: String,
+    payload: CancelRunRequest,
+) -> Result<CommandAcceptedResponse, String> {
+    nalarvo_client::cancel_run(
+        &daemon_url,
+        &token,
+        &company_id,
+        &project_id,
+        &run_id,
+        &payload,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_execution_steps(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    run_id: String,
+) -> Result<ExecutionStepListResponse, String> {
+    nalarvo_client::list_execution_steps(&daemon_url, &token, &company_id, &project_id, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_get_run_timeline(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    run_id: String,
+) -> Result<TimelineResponse, String> {
+    nalarvo_client::get_run_timeline(&daemon_url, &token, &company_id, &project_id, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_get_runtime_result(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    run_id: String,
+) -> Result<RuntimeResultResponse, String> {
+    nalarvo_client::get_runtime_result(&daemon_url, &token, &company_id, &project_id, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_usage_records(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    run_id: String,
+) -> Result<UsageRecordListResponse, String> {
+    nalarvo_client::list_usage_records(&daemon_url, &token, &company_id, &project_id, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn start_daemon() -> Result<(String, Child), String> {
     let daemon_name = if cfg!(windows) {
         "nalarvo-daemon.exe"
@@ -971,7 +1106,16 @@ pub fn run() {
             core_delete_dependency,
             core_list_assignments,
             core_create_assignment,
-            core_assignment_lifecycle
+            core_assignment_lifecycle,
+            core_list_runs,
+            core_get_run,
+            core_create_run,
+            core_queue_run,
+            core_cancel_run,
+            core_list_execution_steps,
+            core_get_run_timeline,
+            core_get_runtime_result,
+            core_list_usage_records
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nalarvo desktop");

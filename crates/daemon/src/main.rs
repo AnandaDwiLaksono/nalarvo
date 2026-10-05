@@ -1,5 +1,6 @@
 use clap::Parser;
 use nalarvo_application::{ApplicationContext, start_outbox_dispatcher};
+use nalarvo_runtime::{SupervisorConfig, start_runtime_supervisor};
 use nalarvo_secret_store_windows::WindowsCredentialStore;
 use rand::Rng;
 use std::{net::SocketAddr, sync::Arc};
@@ -42,7 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
     // Start background outbox dispatcher
-    let _dispatcher = start_outbox_dispatcher(app_ctx.clone(), 500, "daemon-dispatcher".into());
+    let dispatcher = start_outbox_dispatcher(app_ctx.clone(), 500, "daemon-dispatcher".into());
+
+    // Start background runtime supervisor
+    let supervisor = start_runtime_supervisor(app_ctx.pool.clone(), SupervisorConfig::default());
 
     let listener = TcpListener::bind(args.bind).await?;
     if args.emit_token {
@@ -51,7 +55,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(address = %listener.local_addr()?, "Nalarvo Core listening");
 
     let router = nalarvo_local_api::router_with_app(Arc::<str>::from(token), Some(app_ctx));
-    axum::serve(listener, router).await?;
+    let serve_result = axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl-C handler");
+        })
+        .await;
+
+    dispatcher.abort();
+    supervisor.shutdown().await;
+    let _ = dispatcher.await;
+
+    serve_result?;
     Ok(())
 }
 

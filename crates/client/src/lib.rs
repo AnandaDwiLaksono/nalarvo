@@ -21,6 +21,9 @@ use nalarvo_contracts::{
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
+pub mod m4;
+pub use m4::*;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("daemon request failed: {0}")]

@@ -9,6 +9,10 @@ license.workspace = true
 nalarvo-contracts = { path = "../contracts" }
 nalarvo-domain = { path = "../domain" }
 nalarvo-application = { path = "../application" }
+nalarvo-persistence = { path = "../persistence" }
+chrono.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
+uuid.workspace = true
 axum = { workspace = true, features = ["macros"] }
 futures-util.workspace = true
 serde.workspace = true

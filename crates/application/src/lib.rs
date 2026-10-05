@@ -27,6 +27,7 @@ use tracing::error;
 use uuid::Uuid;
 
 pub mod m2;
+pub mod m4;
 pub use nalarvo_persistence::{
     AgentRecord, CredentialRefRecord, DepartmentRecord, ProviderConnectionRecord, RoleRecord,
     WorkspaceRecord,
