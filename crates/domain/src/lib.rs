@@ -2507,9 +2507,418 @@ impl ExecutionStep {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDefinition {
+    pub key: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GrantEffect {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionGrant {
+    pub id: String,
+    pub workspace_id: String,
+    pub company_id: String,
+    pub permission_definition_id: String,
+    pub permission: String,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub effect: GrantEffect,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyVersion {
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolicyEffect {
+    Allow,
+    Deny,
+    RequireApproval,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    pub id: String,
+    pub version: PolicyVersion,
+    pub permission: String,
+    pub effect: PolicyEffect,
+    pub company_rule: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GovernanceContext {
+    pub company_id: String,
+    pub actor: PrincipalRef,
+    pub action: String,
+    pub resource: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityDecision {
+    Deny,
+    RequireApproval,
+    Allow,
+}
+
+pub fn evaluate_authority(
+    context: &GovernanceContext,
+    grants: &[PermissionGrant],
+    policies: &[Policy],
+) -> AuthorityDecision {
+    let relevant_policies: Vec<&Policy> = policies
+        .iter()
+        .filter(|p| p.permission == context.action)
+        .collect();
+    if relevant_policies
+        .iter()
+        .any(|p| p.company_rule && p.effect == PolicyEffect::Deny)
+    {
+        return AuthorityDecision::Deny;
+    }
+    if relevant_policies
+        .iter()
+        .any(|p| !p.company_rule && p.effect == PolicyEffect::Deny)
+    {
+        return AuthorityDecision::Deny;
+    }
+    let actor_grants: Vec<&PermissionGrant> = grants
+        .iter()
+        .filter(|g| {
+            g.company_id == context.company_id
+                && g.principal_id == context.actor.principal_id
+                && g.principal_type == context.actor.principal_type.to_string()
+                && g.permission == context.action
+        })
+        .collect();
+    if actor_grants.iter().any(|g| g.effect == GrantEffect::Deny) {
+        return AuthorityDecision::Deny;
+    }
+    if !actor_grants.iter().any(|g| g.effect == GrantEffect::Allow) {
+        return AuthorityDecision::Deny;
+    }
+    if relevant_policies
+        .iter()
+        .any(|p| p.effect == PolicyEffect::RequireApproval)
+    {
+        return AuthorityDecision::RequireApproval;
+    }
+    AuthorityDecision::Allow
+}
+
+pub const CANONICAL_PERMISSION_DEFINITIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "company.read",
+        "company",
+        "read",
+        "Read company information",
+    ),
+    (
+        "company.modify",
+        "company",
+        "modify",
+        "Modify company configuration",
+    ),
+    ("project.read", "project", "read", "Read project details"),
+    (
+        "project.modify",
+        "project",
+        "modify",
+        "Modify project configuration",
+    ),
+    (
+        "project.allocate_agent",
+        "project",
+        "allocate_agent",
+        "Allocate agent to project",
+    ),
+    ("agent.read", "agent", "read", "Read agent configuration"),
+    (
+        "agent.modify",
+        "agent",
+        "modify",
+        "Modify agent configuration",
+    ),
+    ("provider.use", "provider", "use", "Use AI model provider"),
+    (
+        "credential.use",
+        "credential",
+        "use",
+        "Use stored credentials",
+    ),
+    (
+        "filesystem.list",
+        "filesystem",
+        "list",
+        "List files in directory",
+    ),
+    (
+        "filesystem.read",
+        "filesystem",
+        "read",
+        "Read file contents",
+    ),
+    (
+        "filesystem.write",
+        "filesystem",
+        "write",
+        "Write file contents",
+    ),
+    (
+        "shell.execute",
+        "shell",
+        "execute",
+        "Execute shell commands",
+    ),
+    ("artifact.read", "artifact", "read", "Read run artifacts"),
+    ("artifact.write", "artifact", "write", "Write run artifacts"),
+    ("knowledge.read", "knowledge", "read", "Read knowledge base"),
+    (
+        "knowledge.write",
+        "knowledge",
+        "write",
+        "Write knowledge base",
+    ),
+    (
+        "extension.install",
+        "extension",
+        "install",
+        "Install extensions",
+    ),
+    (
+        "extension.enable",
+        "extension",
+        "enable",
+        "Enable extensions",
+    ),
+    (
+        "capability.invoke",
+        "capability",
+        "invoke",
+        "Invoke extension capabilities",
+    ),
+    ("budget.modify", "budget", "modify", "Modify budget limits"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActionAuthorizationState {
+    Proposed,
+    Evaluating,
+    Allowed,
+    Denied,
+    ApprovalRequired,
+    Approved,
+    Rejected,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActionExecutionState {
+    NotStarted,
+    Executing,
+    Succeeded,
+    Failed,
+    Cancelled,
+    OutcomeUnknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Action {
+    pub id: String,
+    pub company_id: String,
+    pub run_id: Option<String>,
+    pub action_type: String,
+    pub target: String,
+    pub fingerprint: String,
+    pub authorization: ActionAuthorizationState,
+    pub execution: ActionExecutionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApprovalRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub requester: PrincipalRef,
+    pub fingerprint: String,
+    pub status: ApprovalRequestStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDecision {
+    pub approver: PrincipalRef,
+    pub fingerprint: String,
+    pub approved: bool,
+}
+
+impl ApprovalRequest {
+    pub fn decide(
+        &self,
+        approver: PrincipalRef,
+        fingerprint: &str,
+        approved: bool,
+    ) -> Result<ApprovalDecision, DomainError> {
+        if self.status != ApprovalRequestStatus::Pending {
+            return Err(DomainError::Validation(format!(
+                "Approval is not pending: {:?}",
+                self.status
+            )));
+        }
+        if self.requester == approver {
+            return Err(DomainError::Validation(
+                "Requester cannot approve own request".into(),
+            ));
+        }
+        if self.fingerprint != fingerprint {
+            return Err(DomainError::Validation(
+                "Approval fingerprint mismatch".into(),
+            ));
+        }
+        Ok(ApprovalDecision {
+            approver,
+            fingerprint: fingerprint.into(),
+            approved,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn governance_authority_defaults_deny_and_obeys_deny_and_approval() {
+        let context = GovernanceContext {
+            company_id: "c".into(),
+            actor: PrincipalRef::agent("a"),
+            action: "deploy".into(),
+            resource: "prod".into(),
+        };
+        assert_eq!(
+            evaluate_authority(&context, &[], &[]),
+            AuthorityDecision::Deny
+        );
+        let grant = PermissionGrant {
+            id: "g1".into(),
+            workspace_id: "w1".into(),
+            company_id: "c".into(),
+            permission_definition_id: "p1".into(),
+            permission: "deploy".into(),
+            principal_type: "AGENT".into(),
+            principal_id: "a".into(),
+            scope_type: "COMPANY".into(),
+            scope_id: "c".into(),
+            effect: GrantEffect::Allow,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let approval = Policy {
+            id: "pol1".into(),
+            version: PolicyVersion { version: 1 },
+            permission: "deploy".into(),
+            effect: PolicyEffect::RequireApproval,
+            company_rule: false,
+        };
+        assert_eq!(
+            evaluate_authority(&context, std::slice::from_ref(&grant), &[approval]),
+            AuthorityDecision::RequireApproval
+        );
+        let deny = Policy {
+            id: "pol2".into(),
+            version: PolicyVersion { version: 2 },
+            permission: "deploy".into(),
+            effect: PolicyEffect::Deny,
+            company_rule: false,
+        };
+        assert_eq!(
+            evaluate_authority(&context, &[grant], &[deny]),
+            AuthorityDecision::Deny
+        );
+    }
+
+    #[test]
+    fn restrictive_company_policy_overrides_direct_allow() {
+        let context = GovernanceContext {
+            company_id: "c".into(),
+            actor: PrincipalRef::agent("a"),
+            action: "deploy".into(),
+            resource: "prod".into(),
+        };
+        let grant = PermissionGrant {
+            id: "g1".into(),
+            workspace_id: "w1".into(),
+            company_id: "c".into(),
+            permission_definition_id: "p1".into(),
+            permission: "deploy".into(),
+            principal_type: "AGENT".into(),
+            principal_id: "a".into(),
+            scope_type: "COMPANY".into(),
+            scope_id: "c".into(),
+            effect: GrantEffect::Allow,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let policy = Policy {
+            id: "pol1".into(),
+            version: PolicyVersion { version: 1 },
+            permission: "deploy".into(),
+            effect: PolicyEffect::Deny,
+            company_rule: true,
+        };
+        assert_eq!(
+            evaluate_authority(&context, &[grant], &[policy]),
+            AuthorityDecision::Deny
+        );
+    }
+
+    #[test]
+    fn approvals_bind_fingerprint_and_reject_self_approval() {
+        let request = ApprovalRequest {
+            requester: PrincipalRef::user("u"),
+            fingerprint: "f1".into(),
+            status: ApprovalRequestStatus::Pending,
+        };
+        assert!(request.decide(PrincipalRef::user("u"), "f1", true).is_err());
+        assert!(request.decide(PrincipalRef::user("v"), "f2", true).is_err());
+        assert!(request.decide(PrincipalRef::user("v"), "f1", true).is_ok());
+    }
+
+    #[test]
+    fn action_keeps_authorization_separate_from_execution() {
+        let action = Action {
+            id: "action-1".into(),
+            company_id: "company-1".into(),
+            run_id: None,
+            action_type: "filesystem.write".into(),
+            target: "note.txt".into(),
+            fingerprint: "fingerprint-1".into(),
+            authorization: ActionAuthorizationState::Proposed,
+            execution: ActionExecutionState::OutcomeUnknown,
+        };
+        assert_eq!(action.authorization, ActionAuthorizationState::Proposed);
+        assert_eq!(action.execution, ActionExecutionState::OutcomeUnknown);
+        assert_eq!(
+            ActionExecutionState::Cancelled,
+            ActionExecutionState::Cancelled
+        );
+    }
 
     #[test]
     fn test_company_creation_and_optimistic_concurrency() {

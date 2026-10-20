@@ -26,8 +26,16 @@ use tokio::sync::broadcast;
 use tracing::error;
 use uuid::Uuid;
 
+pub mod audit;
+pub mod credential_broker;
 pub mod m2;
 pub mod m4;
+pub mod m5;
+#[cfg(windows)]
+pub mod project_filesystem;
+pub use audit::SqliteAuditSink;
+pub use credential_broker::{CredentialBroker, CredentialBrokerRequest};
+pub use m5::{ProposeActionCommand, ProposedActionOutcome};
 pub use nalarvo_persistence::{
     AgentRecord, CredentialRefRecord, DepartmentRecord, ProviderConnectionRecord, RoleRecord,
     WorkspaceRecord,
@@ -345,6 +353,7 @@ pub struct ApplicationContext {
     pub pool: SqlitePool,
     pub event_broadcaster: broadcast::Sender<DomainEvent>,
     pub audit_sink: Arc<dyn AuditSink>,
+    pub(crate) durable_audit_sink: SqliteAuditSink,
     secret_store: Arc<dyn SecretStore>,
 }
 
@@ -489,6 +498,10 @@ macro_rules! m3_transition {
 }
 
 impl ApplicationContext {
+    pub fn credential_broker(&self) -> CredentialBroker {
+        CredentialBroker::new(self.clone(), Arc::clone(&self.secret_store))
+    }
+
     pub fn new(pool: SqlitePool) -> Self {
         Self::with_ports(
             pool,
@@ -506,6 +519,14 @@ impl ApplicationContext {
         self
     }
 
+    /// Persist first; emit diagnostic only after commit. Use `durable_audit_sink.record_tx`
+    /// inside business transactions so audit failure rolls the mutation back.
+    pub async fn record_audit(&self, record: AuditRecord) -> Result<(), ApplicationError> {
+        self.durable_audit_sink.record(&record).await?;
+        self.audit_sink.record(record);
+        Ok(())
+    }
+
     pub fn with_ports(
         pool: SqlitePool,
         audit_sink: Arc<dyn AuditSink>,
@@ -513,6 +534,7 @@ impl ApplicationContext {
     ) -> Self {
         let (event_broadcaster, _) = broadcast::channel(1024);
         Self {
+            durable_audit_sink: SqliteAuditSink::new(pool.clone()),
             pool,
             event_broadcaster,
             audit_sink,

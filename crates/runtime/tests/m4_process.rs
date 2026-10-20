@@ -148,6 +148,9 @@ fn request(mode: MockMode) -> RunExecutionRequest {
         expected_run_version: 1,
         mock_mode: mode,
         cancel_rx: None,
+        action_handler: None,
+        model_handler: None,
+        resume_proposal: None,
     }
 }
 
@@ -280,8 +283,10 @@ async fn test_process_happy_path_vertical() {
         .unwrap();
     assert_eq!(wi_status, "IN_PROGRESS");
 
-    // Verify zero M5 actions/tools tables
-    let actions_count: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('actions', 'tool_invocations')")
+    // Verify zero M5 actions/tools records for this M4 run
+    let actions_count: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM actions WHERE run_id = ?) + (SELECT count(*) FROM tool_invocations WHERE run_id = ?)")
+        .bind(&run.id)
+        .bind(&run.id)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -316,7 +321,7 @@ async fn test_duplicate_start_run_real_process() {
         pool.clone(),
         SupervisorConfig {
             max_concurrency: 2,
-            lease_duration_secs: 5,
+            lease_duration_secs: 20,
             heartbeat_interval_secs: 1,
             worker_principal_id: "system:supervisor-1".into(),
         },

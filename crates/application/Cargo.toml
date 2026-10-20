@@ -9,6 +9,8 @@ license.workspace = true
 nalarvo-domain = { path = "../domain" }
 nalarvo-persistence = { path = "../persistence" }
 chrono.workspace = true
+hex = "0.4"
+sha2 = "0.10"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,6 +20,9 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
 
 [dev-dependencies]
 axum.workspace = true

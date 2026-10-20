@@ -26,6 +26,7 @@ use std::{
 #[derive(Serialize)]
 struct DesktopWorkspace {
     id: String,
+    owner_user_id: String,
     name: String,
     lifecycle_state: String,
 }
@@ -116,6 +117,7 @@ async fn core_get_workspace(
         .map_err(|e| e.to_string())?;
     Ok(DesktopWorkspace {
         id: w.id,
+        owner_user_id: w.owner_user_id,
         name: w.name,
         lifecycle_state: w.status,
     })
@@ -874,6 +876,53 @@ impl Drop for DaemonChild {
 }
 
 #[tauri::command]
+async fn core_list_actions(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+) -> Result<Vec<nalarvo_contracts::ActionSummaryDto>, String> {
+    nalarvo_client::list_actions(&daemon_url, &token, &company_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_get_action(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    action_id: String,
+) -> Result<nalarvo_contracts::ActionSummaryDto, String> {
+    nalarvo_client::get_action(&daemon_url, &token, &company_id, &action_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_list_approvals(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+) -> Result<Vec<nalarvo_contracts::ApprovalInboxItem>, String> {
+    nalarvo_client::list_approvals(&daemon_url, &token, &company_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn core_decide_approval(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    approval_id: String,
+    payload: nalarvo_contracts::DecideApprovalRequest,
+) -> Result<nalarvo_contracts::DecideApprovalResponse, String> {
+    nalarvo_client::decide_approval(&daemon_url, &token, &company_id, &approval_id, &payload)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn core_list_runs(
     token: tauri::State<'_, String>,
     daemon_url: tauri::State<'_, String>,
@@ -1115,7 +1164,11 @@ pub fn run() {
             core_list_execution_steps,
             core_get_run_timeline,
             core_get_runtime_result,
-            core_list_usage_records
+            core_list_usage_records,
+            core_list_actions,
+            core_get_action,
+            core_list_approvals,
+            core_decide_approval
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nalarvo desktop");

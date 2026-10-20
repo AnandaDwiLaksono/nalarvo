@@ -16,6 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod m4;
+pub mod m5;
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {

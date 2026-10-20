@@ -119,6 +119,7 @@ pub enum MockMode {
     MALFORMED_RESPONSE,
     PROVIDER_UNAVAILABLE,
     CANCELLED,
+    TOOL_PROPOSAL,
 }
 pub struct MockProvider;
 impl MockProvider {
@@ -159,6 +160,16 @@ impl MockProvider {
             MockMode::SUCCESS_STRUCTURED => Ok(ModelResponse {
                 text: None,
                 structured: Some(serde_json::json!({"ok": true})),
+                ..response
+            }),
+            MockMode::TOOL_PROPOSAL => Ok(ModelResponse {
+                text: None,
+                structured: Some(serde_json::json!({
+                    "call_id": "mock-write-1",
+                    "tool_name": "filesystem.write",
+                    "target": "note.txt",
+                    "arguments": {"path": "note.txt", "content": "approved content"}
+                })),
                 ..response
             }),
             other => Err(ProviderError::new(

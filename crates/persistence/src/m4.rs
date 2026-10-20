@@ -167,6 +167,11 @@ pub async fn queue_run(
     }
     validate_json(&job.payload)?;
     let mut tx = pool.begin().await?;
+    let governed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions a JOIN runs r ON r.id=a.run_id WHERE r.id=? AND r.company_id=? AND r.lifecycle_state='WAITING_APPROVAL' AND a.authorization IN ('APPROVAL_REQUIRED','APPROVED','REJECTED','EXPIRED')")
+        .bind(run_id).bind(&company_id.0).fetch_one(&mut *tx).await?;
+    if governed != 0 {
+        return validation("Governed approval requires durable decision transaction");
+    }
     let result = sqlx::query("UPDATE runs SET lifecycle_state = 'QUEUED', updated_at = ?, row_version = row_version + 1 WHERE id = ? AND company_id = ? AND row_version = ? AND lifecycle_state IN ('QUEUED', 'PAUSED', 'WAITING_APPROVAL', 'WAITING_DEPENDENCY')")
         .bind(now()).bind(run_id).bind(&company_id.0).bind(expected_version).execute(&mut *tx).await?;
     if result.rows_affected() != 1 {
@@ -223,8 +228,8 @@ pub async fn heartbeat_lease(
     let mut tx = pool.begin().await?;
     let at = Utc::now();
     let until = at + lease_for;
-    let row = sqlx::query("SELECT run_id FROM run_execution_leases WHERE id = ? AND worker_principal_id = ? AND lease_version = ? AND released_at IS NULL AND expires_at > ?")
-        .bind(lease_id).bind(worker_principal_id).bind(expected_version).bind(time(at))
+    let row = sqlx::query("SELECT run_id FROM run_execution_leases WHERE id = ? AND worker_principal_id = ? AND lease_version = ? AND released_at IS NULL")
+        .bind(lease_id).bind(worker_principal_id).bind(expected_version)
         .fetch_optional(&mut *tx).await?;
     let Some(row) = row else { return Ok(None) };
     let run_id: String = row.get(0);
@@ -240,8 +245,8 @@ pub async fn heartbeat_lease(
     {
         return Ok(None);
     }
-    let updated = sqlx::query("UPDATE run_execution_leases SET heartbeat_at = ?, expires_at = ?, lease_version = lease_version + 1 WHERE id = ? AND worker_principal_id = ? AND lease_version = ? AND released_at IS NULL AND expires_at > ?")
-        .bind(time(at)).bind(time(until)).bind(lease_id).bind(worker_principal_id).bind(expected_version).bind(time(at)).execute(&mut *tx).await?;
+    let updated = sqlx::query("UPDATE run_execution_leases SET heartbeat_at = ?, expires_at = ?, lease_version = lease_version + 1 WHERE id = ? AND worker_principal_id = ? AND lease_version = ? AND released_at IS NULL")
+        .bind(time(at)).bind(time(until)).bind(lease_id).bind(worker_principal_id).bind(expected_version).execute(&mut *tx).await?;
     if updated.rows_affected() != 1 {
         return Ok(None);
     }
@@ -279,22 +284,26 @@ async fn verify_current_lease_tx(
     version: i64,
     at: DateTime<Utc>,
 ) -> Result<bool, PersistenceError> {
-    let matching: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM run_execution_leases WHERE run_id = ? AND worker_principal_id = ? AND id = ? AND lease_version = ? AND released_at IS NULL AND expires_at > ?",
-    )
-    .bind(run_id).bind(principal).bind(lease_id).bind(version).bind(time(at))
-    .fetch_one(&mut **tx).await?;
-    if matching != 1 {
-        return Ok(false);
+    let rows = sqlx::query("SELECT id,worker_principal_id,lease_version,expires_at FROM run_execution_leases WHERE run_id=? AND released_at IS NULL")
+        .bind(run_id).fetch_all(&mut **tx).await?;
+    let mut active = 0;
+    let mut matching = false;
+    for row in rows {
+        let expiry: String = row.try_get("expires_at")?;
+        let Ok(expiry) = DateTime::parse_from_rfc3339(&expiry) else {
+            return Ok(false);
+        };
+        if expiry.with_timezone(&Utc) > at {
+            active += 1;
+            matching |= row.get::<String, _>("id") == lease_id
+                && row.get::<String, _>("worker_principal_id") == principal
+                && row.get::<i64, _>("lease_version") == version;
+        }
     }
-    let active: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM run_execution_leases WHERE run_id = ? AND released_at IS NULL AND expires_at > ?",
-    )
-    .bind(run_id).bind(time(at)).fetch_one(&mut **tx).await?;
-    Ok(active == 1)
+    Ok(matching && active == 1)
 }
 
-async fn require_current_lease_tx(
+pub async fn require_current_lease_tx(
     tx: &mut Transaction<'_, Sqlite>,
     lease: &ExecutionLease,
 ) -> Result<(), PersistenceError> {
@@ -374,11 +383,35 @@ pub async fn release_lease(
 }
 
 pub async fn expire_leases(pool: &SqlitePool, at: DateTime<Utc>) -> Result<u64, PersistenceError> {
-    let mut tx = pool.begin().await?;
-    let released = sqlx::query("UPDATE run_execution_leases SET released_at = ?, release_reason = 'EXPIRED' WHERE released_at IS NULL AND expires_at <= ?").bind(time(at)).bind(time(at)).execute(&mut *tx).await?.rows_affected();
-    sqlx::query("UPDATE durable_jobs SET status = 'PENDING', lease_owner = NULL, lease_until = NULL, available_at = ?, updated_at = ? WHERE status = 'CLAIMED' AND lease_until <= ?").bind(time(at)).bind(time(at)).bind(time(at)).execute(&mut *tx).await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let rows =
+        sqlx::query("SELECT id,expires_at FROM run_execution_leases WHERE released_at IS NULL")
+            .fetch_all(&mut *tx)
+            .await?;
+    let mut released = 0;
+    for row in rows {
+        let expiry: String = row.try_get("expires_at")?;
+        if !lease_instant_is_live(&expiry, at) {
+            released += sqlx::query("UPDATE run_execution_leases SET released_at=?,release_reason='EXPIRED' WHERE id=? AND released_at IS NULL")
+                .bind(time(at)).bind(row.try_get::<String,_>("id")?).execute(&mut *tx).await?.rows_affected();
+        }
+    }
+    let jobs = sqlx::query("SELECT id,lease_until FROM durable_jobs WHERE status='CLAIMED'")
+        .fetch_all(&mut *tx)
+        .await?;
+    for row in jobs {
+        let expiry: Option<String> = row.try_get("lease_until")?;
+        if !expiry.is_some_and(|expiry| lease_instant_is_live(&expiry, at)) {
+            sqlx::query("UPDATE durable_jobs SET status='PENDING',lease_owner=NULL,lease_until=NULL,available_at=?,updated_at=? WHERE id=? AND status='CLAIMED'")
+                .bind(time(at)).bind(time(at)).bind(row.try_get::<String,_>("id")?).execute(&mut *tx).await?;
+        }
+    }
     tx.commit().await?;
     Ok(released)
+}
+
+fn lease_instant_is_live(value: &str, at: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(value).is_ok_and(|time| time.with_timezone(&Utc) > at)
 }
 
 pub async fn transition_run(
@@ -432,7 +465,7 @@ pub async fn transition_run_with_lease(
     Ok(run)
 }
 
-async fn transition_run_tx(
+pub async fn transition_run_tx(
     tx: &mut Transaction<'_, Sqlite>,
     company_id: &CompanyId,
     run_id: &str,
@@ -484,6 +517,38 @@ pub async fn append_step_with_lease(
     Ok(())
 }
 
+/// Resolve the canonical operational turn, creating it via Pending -> Running when
+/// Core is invoked without a pre-existing model turn.
+pub async fn resolve_tool_step(
+    pool: &SqlitePool,
+    lease: &ExecutionLease,
+    company_id: &CompanyId,
+) -> Result<String, PersistenceError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_current_lease_tx(&mut tx, lease).await?;
+    if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM execution_steps WHERE run_id=? AND company_id=? AND step_type IN ('MODEL_CALL','TOOL_OPERATION') ORDER BY sequence_no DESC LIMIT 1")
+        .bind(&lease.run_id).bind(&company_id.0).fetch_optional(&mut *tx).await? {
+        tx.commit().await?;
+        return Ok(id);
+    }
+    let sequence: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence_no),0)+1 FROM execution_steps WHERE run_id=?",
+    )
+    .bind(&lease.run_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let mut step = ExecutionStep::create(
+        company_id.clone(),
+        lease.run_id.clone(),
+        sequence as u32,
+        "TOOL_OPERATION".into(),
+    )?;
+    step.start()?;
+    append_step_tx(&mut tx, &step).await?;
+    tx.commit().await?;
+    Ok(step.id)
+}
+
 async fn append_step_tx(
     tx: &mut Transaction<'_, Sqlite>,
     step: &ExecutionStep,
@@ -523,6 +588,30 @@ pub async fn append_invocation_with_lease(
     Ok(())
 }
 
+/// Commit provider response and observed token usage together, under one live lease.
+pub async fn append_model_outcome_with_lease(
+    pool: &SqlitePool,
+    lease: &ExecutionLease,
+    invocation: &ModelInvocation,
+    usage: Option<&UsageRecord>,
+) -> Result<(), PersistenceError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_current_lease_tx(&mut tx, lease).await?;
+    append_invocation_tx(&mut tx, invocation).await?;
+    if let Some(usage) = usage {
+        append_usage_tx(&mut tx, usage).await?;
+    }
+    // Unproven external outcomes retain HELD; never refund unknown consumption.
+    if !matches!(
+        invocation.failure_class.as_deref(),
+        Some("PROVIDER_TIMEOUT" | "CANCELLED" | "PROVIDER_UNAVAILABLE")
+    ) {
+        crate::m5::settle_model_reservation_tx(&mut tx, &invocation.id, false).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn append_invocation_tx(
     tx: &mut Transaction<'_, Sqlite>,
     invocation: &ModelInvocation,
@@ -544,6 +633,316 @@ pub async fn append_checkpoint(
     sqlx::query("INSERT INTO runtime_checkpoints(id, company_id, run_id, checkpoint_version, run_state, last_completed_step, active_step, execution_phase, context_refs, continuation_metadata, usage_snapshot, safe_to_resume, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runs WHERE id = ? AND company_id = ?)")
         .bind(&checkpoint.id).bind(&checkpoint.company_id.0).bind(&checkpoint.run_id).bind(checkpoint.checkpoint_version).bind(&checkpoint.run_state).bind(checkpoint.last_completed_step).bind(checkpoint.active_step).bind(&checkpoint.execution_phase).bind(optional_json(checkpoint.context_refs.as_ref())?).bind(optional_json(checkpoint.continuation_metadata.as_ref())?).bind(optional_json(checkpoint.usage_snapshot.as_ref())?).bind(checkpoint.safe_to_resume).bind(now()).bind(&checkpoint.run_id).bind(&checkpoint.company_id.0).execute(pool).await?;
     Ok(())
+}
+
+/// Persist suspension and remove claimability atomically under the active lease.
+pub async fn suspend_for_approval(
+    pool: &SqlitePool,
+    lease: &ExecutionLease,
+    company_id: &CompanyId,
+    expected_version: i64,
+    checkpoint: &RuntimeCheckpoint,
+    event: &DomainEvent,
+) -> Result<Run, PersistenceError> {
+    if checkpoint.run_id != lease.run_id
+        || checkpoint.company_id != *company_id
+        || checkpoint.run_state != "WAITING_APPROVAL"
+        || !checkpoint.safe_to_resume
+    {
+        return validation("approval checkpoint scope invalid");
+    }
+    validate_optional_json(checkpoint.context_refs.as_ref())?;
+    validate_optional_json(checkpoint.continuation_metadata.as_ref())?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_current_lease_tx(&mut tx, lease).await?;
+    let run = transition_run_tx(
+        &mut tx,
+        company_id,
+        &lease.run_id,
+        expected_version,
+        RunStatus::WaitingApproval,
+        None,
+        None,
+    )
+    .await?;
+    let changed = sqlx::query("UPDATE durable_jobs SET status='WAITING_APPROVAL', lease_owner=NULL, lease_until=NULL, updated_at=? WHERE run_id=? AND company_id=? AND status='CLAIMED' AND lease_owner=?")
+        .bind(now()).bind(&lease.run_id).bind(&company_id.0).bind(&lease.worker_principal_id)
+        .execute(&mut *tx).await?;
+    if changed.rows_affected() != 1 {
+        return validation("claimed approval job missing");
+    }
+    sqlx::query("INSERT INTO runtime_checkpoints(id,company_id,run_id,checkpoint_version,run_state,last_completed_step,active_step,execution_phase,context_refs,continuation_metadata,usage_snapshot,safe_to_resume,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&checkpoint.id).bind(&company_id.0).bind(&lease.run_id).bind(checkpoint.checkpoint_version)
+        .bind(&checkpoint.run_state).bind(checkpoint.last_completed_step).bind(checkpoint.active_step)
+        .bind(&checkpoint.execution_phase).bind(optional_json(checkpoint.context_refs.as_ref())?)
+        .bind(optional_json(checkpoint.continuation_metadata.as_ref())?)
+        .bind(optional_json(checkpoint.usage_snapshot.as_ref())?).bind(checkpoint.safe_to_resume).bind(now())
+        .execute(&mut *tx).await?;
+    sqlx::query("UPDATE run_execution_leases SET released_at=?,release_reason='WAITING_APPROVAL' WHERE id=? AND lease_version=? AND released_at IS NULL")
+        .bind(now()).bind(&lease.id).bind(lease.lease_version).execute(&mut *tx).await?;
+    insert_safe_event_tx(&mut tx, event).await?;
+    tx.commit().await?;
+    Ok(run)
+}
+
+/// Recover only a never-started, uniquely bound approval after the worker lease is gone.
+/// The caller must run this before generic orphan failure and before dispatching jobs.
+pub async fn recover_orphaned_approval(
+    pool: &SqlitePool,
+    company_id: &CompanyId,
+    run_id: &str,
+    recovery_principal: &str,
+) -> Result<bool, PersistenceError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let at = Utc::now();
+    let Some(run) = get_run_tx(&mut tx, company_id, run_id).await? else {
+        return Ok(false);
+    };
+    if run.status != RunStatus::Running {
+        return Ok(false);
+    }
+    let leases = sqlx::query("SELECT worker_principal_id,expires_at,released_at,release_reason FROM run_execution_leases WHERE run_id=?")
+        .bind(run_id).fetch_all(&mut *tx).await?;
+    for lease in &leases {
+        let expiry: String = lease.try_get("expires_at")?;
+        let Ok(expiry) = DateTime::parse_from_rfc3339(&expiry) else {
+            return Ok(false);
+        };
+        if lease.try_get::<Option<String>, _>("released_at")?.is_none()
+            && expiry.with_timezone(&Utc) > at
+        {
+            return Ok(false);
+        }
+    }
+    let job = sqlx::query("SELECT id,status,attempt,max_attempts,lease_owner FROM durable_jobs WHERE run_id=? AND company_id=? AND job_type='EXECUTE_RUN'")
+        .bind(run_id).bind(&company_id.0).fetch_optional(&mut *tx).await?;
+    let Some(job) = job else { return Ok(false) };
+    if !matches!(
+        job.get::<String, _>("status").as_str(),
+        "CLAIMED" | "PENDING"
+    ) || job.get::<i64, _>("attempt") >= job.get::<i64, _>("max_attempts")
+    {
+        return Ok(false);
+    }
+    let actions = sqlx::query("SELECT a.id,a.step_id,a.target,a.input,a.idempotency_key,a.authorization,a.status,p.id AS approval_id,p.status AS approval_status,e.payload AS proposed_payload,s.sequence_no FROM actions a JOIN approval_requests p ON p.action_id=a.id AND p.company_id=a.company_id JOIN execution_steps s ON s.id=a.step_id AND s.run_id=a.run_id AND s.company_id=a.company_id AND s.lifecycle_state='RUNNING' JOIN domain_events e ON e.aggregate_id=a.id AND e.event_type='ActionProposed' AND e.company_id=a.company_id AND e.aggregate_type='Action' WHERE a.run_id=? AND a.company_id=? AND NOT EXISTS (SELECT 1 FROM actions other WHERE other.run_id=a.run_id AND other.company_id=a.company_id AND other.id<>a.id)")
+        .bind(run_id).bind(&company_id.0).fetch_all(&mut *tx).await?;
+    if actions.len() != 1 {
+        return Ok(false);
+    }
+    let owner: Option<String> = job.get("lease_owner");
+    let claimed = job.get::<String, _>("status") == "CLAIMED";
+    if claimed && owner.is_none() {
+        return Ok(false);
+    }
+    let mut valid_expired = 0;
+    for lease in &leases {
+        let expiry = DateTime::parse_from_rfc3339(&lease.try_get::<String, _>("expires_at")?)
+            .map_err(|_| DomainError::Validation("Invalid lease expiry".into()))?
+            .with_timezone(&Utc);
+        let released: Option<String> = lease.try_get("released_at")?;
+        let reason: Option<String> = lease.try_get("release_reason")?;
+        let expired = reason.as_deref() == Some("EXPIRED");
+        if expiry <= at
+            && if claimed {
+                owner.as_deref()
+                    == Some(lease.try_get::<String, _>("worker_principal_id")?.as_str())
+                    && (released.is_none() || expired)
+            } else {
+                released.is_some() && expired
+            }
+        {
+            valid_expired += 1;
+        }
+    }
+    if valid_expired != 1 {
+        return Ok(false);
+    }
+    let action = &actions[0];
+    let action_id: String = action.get("id");
+    let step_id: String = action.get("step_id");
+    let approval_id: String = action.get("approval_id");
+    let idempotency_key: String = action.get("idempotency_key");
+    let authorization: String = action.get("authorization");
+    let action_status: String = action.get("status");
+    let approval_status: String = action.get("approval_status");
+    if action_status != "PENDING"
+        || !matches!(
+            (authorization.as_str(), approval_status.as_str()),
+            ("APPROVAL_REQUIRED", "PENDING") | ("APPROVED", "APPROVED")
+        )
+    {
+        return Ok(false);
+    }
+    let invocations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tool_invocations WHERE run_id=? OR action_id=?")
+            .bind(run_id)
+            .bind(&action_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if invocations != 0 {
+        return Ok(false);
+    }
+    let proposed: Value = match serde_json::from_str(&action.get::<String, _>("proposed_payload")) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let Some(fingerprint) = proposed
+        .get("fingerprint")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(false);
+    };
+    let checkpoint = sqlx::query("SELECT checkpoint_version,run_state,execution_phase,safe_to_resume,continuation_metadata FROM runtime_checkpoints WHERE run_id=? AND company_id=? ORDER BY checkpoint_version DESC LIMIT 1")
+        .bind(run_id).bind(&company_id.0).fetch_optional(&mut *tx).await?;
+    let (next, event_type) = if authorization == "APPROVED" {
+        let Some(checkpoint) = checkpoint else {
+            return Ok(false);
+        };
+        let metadata: Value = match checkpoint
+            .get::<Option<String>, _>("continuation_metadata")
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(value) => value,
+            None => return Ok(false),
+        };
+        if checkpoint.get::<String, _>("run_state") != "WAITING_APPROVAL"
+            || checkpoint.get::<String, _>("execution_phase") != "APPROVAL_PENDING"
+            || !checkpoint.get::<bool, _>("safe_to_resume")
+            || metadata["action_id"] != action_id
+            || metadata["step_id"] != step_id
+            || metadata["approval_id"] != approval_id
+            || metadata["fingerprint"] != fingerprint
+            || metadata["idempotency_key"] != idempotency_key
+            || metadata.get("proposal").is_none()
+        {
+            return Ok(false);
+        }
+        ("QUEUED", "RunQueued")
+    } else {
+        if checkpoint.is_some() {
+            return Ok(false);
+        }
+        let Some((call_id, tool_name)) = idempotency_key
+            .strip_prefix(&format!("tool:{run_id}:{step_id}:"))
+            .and_then(|tail| tail.split_once(':'))
+        else {
+            return Ok(false);
+        };
+        if call_id.is_empty() || tool_name.is_empty() || tool_name.contains(':') {
+            return Ok(false);
+        }
+        let mut arguments: Value = match action
+            .get::<Option<String>, _>("input")
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        {
+            Some(value) if value.is_object() => value,
+            _ => return Ok(false),
+        };
+        if arguments.get("tool_id").and_then(Value::as_str) != Some(tool_name) {
+            return Ok(false);
+        }
+        let original_worker = arguments
+            .get("worker_principal_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(original_worker) = original_worker else {
+            return Ok(false);
+        };
+        for key in [
+            "tool_id",
+            "tool_version",
+            "worker_principal_id",
+            "root_binding",
+            "filesystem_binding",
+            "provider_connection_id",
+        ] {
+            arguments.as_object_mut().unwrap().remove(key);
+        }
+        let target: String = action.get("target");
+        let proposal = serde_json::json!({"call_id":call_id,"tool_name":tool_name,"target":target,"arguments":arguments});
+        let metadata = serde_json::json!({"proposal":proposal,"step_id":step_id,"action_id":action_id,"approval_id":approval_id,"fingerprint":fingerprint,"original_worker_principal_id":original_worker,"idempotency_key":idempotency_key});
+        sqlx::query("INSERT INTO runtime_checkpoints(id,company_id,run_id,checkpoint_version,run_state,active_step,execution_phase,context_refs,continuation_metadata,safe_to_resume,created_at) VALUES(?,?,?,?, 'WAITING_APPROVAL',?,'APPROVAL_PENDING',?, ?,1,?)")
+            .bind(Uuid::now_v7().to_string()).bind(&company_id.0).bind(run_id).bind(1_i64)
+            .bind(action.get::<i64, _>("sequence_no"))
+            .bind(serde_json::json!({"correlation_id":run.correlation_id}).to_string())
+            .bind(metadata.to_string()).bind(time(at)).execute(&mut *tx).await?;
+        ("WAITING_APPROVAL", "RunWaitingApproval")
+    };
+    let job_state = if next == "QUEUED" {
+        "PENDING"
+    } else {
+        "WAITING_APPROVAL"
+    };
+    let changed = sqlx::query("UPDATE runs SET lifecycle_state=?,row_version=row_version+1,updated_at=? WHERE id=? AND company_id=? AND lifecycle_state='RUNNING' AND row_version=?")
+        .bind(next).bind(time(at)).bind(run_id).bind(&company_id.0).bind(run.row_version).execute(&mut *tx).await?;
+    if changed.rows_affected() != 1 {
+        return Ok(false);
+    }
+    let changed = sqlx::query("UPDATE durable_jobs SET status=?,lease_owner=NULL,lease_until=NULL,available_at=?,updated_at=? WHERE run_id=? AND company_id=? AND status IN ('CLAIMED','PENDING')")
+        .bind(job_state).bind(time(at)).bind(time(at)).bind(run_id).bind(&company_id.0).execute(&mut *tx).await?;
+    if changed.rows_affected() != 1 {
+        return Ok(false);
+    }
+    // Every unreleased lease was parsed and proved expired under this IMMEDIATE lock.
+    sqlx::query("UPDATE run_execution_leases SET released_at=?,release_reason='APPROVAL_RECOVERED' WHERE run_id=? AND released_at IS NULL")
+        .bind(time(at)).bind(run_id).execute(&mut *tx).await?;
+    let event = DomainEvent {
+        event_id: Uuid::now_v7().to_string(),
+        event_type: event_type.into(),
+        schema_version: 1,
+        company_id: company_id.clone(),
+        aggregate_type: "Run".into(),
+        aggregate_id: run_id.into(),
+        aggregate_version: run.row_version + 1,
+        occurred_at: at,
+        correlation_id: run.correlation_id.clone(),
+        causation_id: approval_id,
+        principal: PrincipalRef::system(recovery_principal),
+        scope: nalarvo_domain::ScopeRef::company(&company_id.0),
+        payload: serde_json::json!({"run_id":run_id,"status":next,"action_id":action_id}),
+    };
+    insert_safe_event_tx(&mut tx, &event).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+pub async fn approval_checkpoint(
+    pool: &SqlitePool,
+    company_id: &CompanyId,
+    run_id: &str,
+) -> Result<Option<RuntimeCheckpoint>, PersistenceError> {
+    let row = sqlx::query("SELECT id,checkpoint_version,run_state,last_completed_step,active_step,execution_phase,context_refs,continuation_metadata,usage_snapshot,safe_to_resume FROM runtime_checkpoints WHERE company_id=? AND run_id=? ORDER BY checkpoint_version DESC LIMIT 1")
+        .bind(&company_id.0).bind(run_id).fetch_optional(pool).await?;
+    row.map(|row| {
+        Ok(RuntimeCheckpoint {
+            id: row.get(0),
+            company_id: company_id.clone(),
+            run_id: run_id.into(),
+            checkpoint_version: row.get(1),
+            run_state: row.get(2),
+            last_completed_step: row.get(3),
+            active_step: row.get(4),
+            execution_phase: row.get(5),
+            context_refs: row
+                .get::<Option<String>, _>(6)
+                .map(|v| serde_json::from_str(&v))
+                .transpose()
+                .map_err(|e| DomainError::Validation(e.to_string()))?,
+            continuation_metadata: row
+                .get::<Option<String>, _>(7)
+                .map(|v| serde_json::from_str(&v))
+                .transpose()
+                .map_err(|e| DomainError::Validation(e.to_string()))?,
+            usage_snapshot: row
+                .get::<Option<String>, _>(8)
+                .map(|v| serde_json::from_str(&v))
+                .transpose()
+                .map_err(|e| DomainError::Validation(e.to_string()))?,
+            safe_to_resume: row.get(9),
+        })
+    })
+    .transpose()
 }
 
 pub async fn append_usage(pool: &SqlitePool, usage: &UsageRecord) -> Result<(), PersistenceError> {
@@ -613,6 +1012,13 @@ pub async fn cancel_run_with_result(
         return stale_tx(&mut tx, run_id, company_id, expected_version).await;
     }
     finalize_steps_jobs_tx(&mut tx, run_id, "CANCELLED", at).await?;
+    sqlx::query("UPDATE durable_jobs SET status='CANCELLED',updated_at=? WHERE run_id=? AND company_id=? AND status='WAITING_APPROVAL'")
+        .bind(time(at)).bind(run_id).bind(&company_id.0).execute(&mut *tx).await?;
+    sqlx::query("UPDATE runtime_checkpoints SET safe_to_resume=0 WHERE run_id=? AND company_id=?")
+        .bind(run_id)
+        .bind(&company_id.0)
+        .execute(&mut *tx)
+        .await?;
     let updated = get_run_tx(&mut tx, company_id, run_id)
         .await?
         .expect("updated run");
@@ -734,9 +1140,16 @@ pub async fn finalize_orphaned_run_with_result(
         return validation("orphan recovery requires FAILED result");
     }
     let mut tx = pool.begin().await?;
-    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_execution_leases WHERE run_id = ? AND released_at IS NULL AND expires_at > ?")
-        .bind(run_id).bind(time(Utc::now())).fetch_one(&mut *tx).await?;
-    if active != 0 {
+    let expiries: Vec<String> = sqlx::query_scalar(
+        "SELECT expires_at FROM run_execution_leases WHERE run_id=? AND released_at IS NULL",
+    )
+    .bind(run_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    if expiries
+        .iter()
+        .any(|expiry| lease_instant_is_live(expiry, Utc::now()))
+    {
         return validation("orphaned run still has an active lease");
     }
     let run = transition_run_tx(
@@ -959,11 +1372,14 @@ fn legal_transition(from: RunStatus, to: RunStatus) -> bool {
         ) | (
             RunStatus::Running,
             RunStatus::Paused
+                | RunStatus::WaitingApproval
+                | RunStatus::WaitingDependency
                 | RunStatus::Succeeded
                 | RunStatus::Failed
                 | RunStatus::TimedOut
                 | RunStatus::Cancelled
         ) | (RunStatus::Paused, RunStatus::Running | RunStatus::Cancelled)
+            | (RunStatus::WaitingApproval, RunStatus::Running)
             | (
                 RunStatus::WaitingApproval | RunStatus::WaitingDependency,
                 RunStatus::Queued | RunStatus::Cancelled

@@ -3,7 +3,12 @@ import { useEffect, useState } from "react";
 import "./app.css";
 
 type Health = { status: string; service: string };
-type Workspace = { id: string; name: string; lifecycle_state: string };
+type Workspace = {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  lifecycle_state: string;
+};
 type Provider = {
   id: string;
   name: string;
@@ -92,7 +97,24 @@ type Run = {
   attempt_number: number;
   created_at: string;
 };
-type Tab = "Departments" | "Roles" | "Agents" | "Projects" | "Work" | "Runs";
+type ApprovalInboxItem = {
+  id: string;
+  fingerprint: string;
+  action_id: string;
+  company_id: string;
+  requested_by_id: string;
+  status: string;
+  reason?: string | null;
+  requested_at: string;
+};
+type Tab =
+  | "Departments"
+  | "Roles"
+  | "Agents"
+  | "Projects"
+  | "Work"
+  | "Runs"
+  | "Approvals";
 
 const DEFAULT_WORKSPACE_ID = "0191e4b8-0002-7000-8000-000000000001";
 
@@ -109,6 +131,7 @@ export default function App() {
   const [dependencies, setDependencies] = useState<WorkDependency[]>([]);
   const [assignments, setAssignments] = useState<WorkAssignment[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalInboxItem[]>([]);
   const [selectedCompany, setSelectedCompany] = useState("");
   const [selectedAgent, setSelectedAgent] = useState("");
   const [selectedProject, setSelectedProject] = useState("");
@@ -242,6 +265,17 @@ export default function App() {
     setRuns(result.runs);
   };
 
+  const loadApprovals = async (companyId: string) => {
+    if (!companyId) {
+      setApprovals([]);
+      return;
+    }
+    const result = await invoke<ApprovalInboxItem[]>("core_list_approvals", {
+      companyId,
+    });
+    setApprovals(result);
+  };
+
   useEffect(() => {
     void (async () => {
       try {
@@ -264,6 +298,9 @@ export default function App() {
     void loadWorkforce(selectedCompany).catch((cause) => {
       console.error("Workforce could not be loaded.", cause);
       setError("Workforce could not be loaded.");
+    });
+    void loadApprovals(selectedCompany).catch((cause) => {
+      console.error("Approvals could not be loaded.", cause);
     });
   }, [selectedCompany]);
 
@@ -571,6 +608,7 @@ export default function App() {
                     "Projects",
                     "Work",
                     "Runs",
+                    "Approvals",
                   ] as const
                 ).map((view) => (
                   <button
@@ -1211,6 +1249,84 @@ export default function App() {
                       </li>
                     ))}
                   </ul>
+                </section>
+              )}
+              {tab === "Approvals" && activeCompany && (
+                <section aria-labelledby="approvals-title">
+                  <h3 id="approvals-title">
+                    Approval Inbox · {activeCompany.name} (
+                    {approvals.filter((a) => a.status === "PENDING").length}{" "}
+                    pending)
+                  </h3>
+                  {approvals.length === 0 ? (
+                    <p>No approvals found.</p>
+                  ) : (
+                    <ul>
+                      {approvals.map((req) => (
+                        <li key={req.id}>
+                          <strong>Request {req.id}</strong> · Action:{" "}
+                          {req.action_id} · Status: {req.status}
+                          {req.reason && <div>Reason: {req.reason}</div>}
+                          {req.status === "PENDING" && (
+                            <div style={{ marginTop: "4px" }}>
+                              <button
+                                type="button"
+                                disabled={
+                                  busy ||
+                                  !workspace?.owner_user_id ||
+                                  !req.fingerprint
+                                }
+                                onClick={() =>
+                                  void mutate(async () => {
+                                    await invoke("core_decide_approval", {
+                                      companyId: activeCompany.id,
+                                      approvalId: req.id,
+                                      payload: {
+                                        decided_by_type: "USER",
+                                        decided_by_id: workspace!.owner_user_id,
+                                        fingerprint: req.fingerprint,
+                                        approved: true,
+                                        reason: "Approved from desktop UI",
+                                      },
+                                    });
+                                    await loadApprovals(activeCompany.id);
+                                  })
+                                }
+                              >
+                                Approve
+                              </button>{" "}
+                              <button
+                                type="button"
+                                disabled={
+                                  busy ||
+                                  !workspace?.owner_user_id ||
+                                  !req.fingerprint
+                                }
+                                onClick={() =>
+                                  void mutate(async () => {
+                                    await invoke("core_decide_approval", {
+                                      companyId: activeCompany.id,
+                                      approvalId: req.id,
+                                      payload: {
+                                        decided_by_type: "USER",
+                                        decided_by_id: workspace!.owner_user_id,
+                                        fingerprint: req.fingerprint,
+                                        approved: false,
+                                        reason: "Rejected from desktop UI",
+                                      },
+                                    });
+                                    await loadApprovals(activeCompany.id);
+                                  })
+                                }
+                              >
+                                Reject
+                              </button>
+                            </div>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </section>
               )}
             </section>

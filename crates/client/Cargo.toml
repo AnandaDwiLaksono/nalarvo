@@ -13,6 +13,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+sqlx.workspace = true
 nalarvo-application = { path = "../application" }
 nalarvo-domain = { path = "../domain" }
 nalarvo-persistence = { path = "../persistence" }

@@ -583,6 +583,15 @@ impl ApplicationContext {
             ));
         }
 
+        if run.status == RunStatus::WaitingApproval {
+            let governed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE company_id=? AND run_id=? AND authorization IN ('APPROVAL_REQUIRED','APPROVED','REJECTED','EXPIRED')")
+                .bind(&company_id.0).bind(run_id).fetch_one(&self.pool).await?;
+            if governed != 0 {
+                return Err(ApplicationError::Validation(
+                    "Governed approval requires durable decision and supervisor resume".into(),
+                ));
+            }
+        }
         let updated = transition_run(
             &self.pool,
             company_id,
@@ -1147,6 +1156,14 @@ impl ApplicationContext {
     }
 
     async fn check_admission(&self, run: &Run) -> Result<(), (String, String)> {
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM companies c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=? AND c.status='ACTIVE' AND w.status='ACTIVE'")
+            .bind(&run.company_id.0).fetch_one(&self.pool).await.map_err(|e| ("ADMISSION_REJECTED".into(),e.to_string()))?;
+        if active != 1 {
+            return Err((
+                "ADMISSION_REJECTED".into(),
+                "Workspace or Company not active".into(),
+            ));
+        }
         // 1. Project check
         let proj = sqlx::query_scalar::<_, String>(
             "SELECT status FROM projects WHERE id = ? AND company_id = ?",
@@ -1216,7 +1233,7 @@ impl ApplicationContext {
 
         // 4. Allocation check: Agent must have an ACTIVE allocation in this project
         let active_alloc: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_allocations WHERE company_id = ? AND project_id = ? AND agent_id = ? AND status = 'ACTIVE'",
+            "SELECT COUNT(*) FROM agent_allocations a JOIN teams t ON t.id=a.team_id AND t.company_id=a.company_id AND t.project_id=a.project_id AND t.status='ACTIVE' WHERE a.company_id = ? AND a.project_id = ? AND a.agent_id = ? AND a.status = 'ACTIVE'",
         )
         .bind(&run.company_id.0)
         .bind(&run.project_id)

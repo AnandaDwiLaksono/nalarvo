@@ -210,6 +210,9 @@ async fn real_worker_process_can_be_cancelled_and_next_child_still_completes() {
         expected_run_version: 1,
         mock_mode: MockMode::DELAYED_SUCCESS,
         cancel_rx: None,
+        action_handler: None,
+        model_handler: None,
+        resume_proposal: None,
     };
     let task = tokio::spawn(execute_run_worker_process(
         executable,

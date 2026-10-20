@@ -1,5 +1,7 @@
 // crates/runtime/src/supervisor.rs
-use crate::worker::{RunExecutionRequest, RuntimeStreamEvent, execute_run_worker_process};
+use crate::worker::{
+    RunExecutionRequest, RuntimeStreamEvent, ToolProposal, execute_run_worker_process,
+};
 use nalarvo_domain::{
     DomainEvent, ExecutionStep, PrincipalRef, PrincipalType, RunStatus, ScopeRef,
 };
@@ -10,6 +12,7 @@ use nalarvo_persistence::m4::{
     expire_leases, finalize_run_with_result_with_lease, get_run, heartbeat_lease,
     release_current_lease, transition_run_with_lease, verify_current_lease,
 };
+use sqlx::Row;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,6 +47,8 @@ pub struct RuntimeSupervisor {
     workers: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    pub action_handler: Option<crate::worker::ActionProposalHandler>,
+    pub model_handler: Option<crate::worker::ModelRequestHandler>,
 }
 
 impl RuntimeSupervisor {
@@ -56,7 +61,29 @@ impl RuntimeSupervisor {
             workers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown_tx,
             shutdown_rx,
+            action_handler: None,
+            model_handler: None,
         }
+    }
+
+    pub fn with_action_handler(mut self, handler: crate::worker::ActionProposalHandler) -> Self {
+        self.action_handler = Some(handler);
+        self
+    }
+
+    pub fn with_model_handler(mut self, handler: crate::worker::ModelRequestHandler) -> Self {
+        self.model_handler = Some(handler);
+        self
+    }
+
+    pub fn with_handlers(
+        mut self,
+        action: crate::worker::ActionProposalHandler,
+        model: crate::worker::ModelRequestHandler,
+    ) -> Self {
+        self.action_handler = Some(action);
+        self.model_handler = Some(model);
+        self
     }
 
     pub fn stop(&self) {
@@ -106,9 +133,20 @@ impl RuntimeSupervisor {
         let pool = self.pool.clone();
         let config = self.config.clone();
         let mut stop_rx = self.shutdown_rx.clone();
+        let action_handler = self.action_handler.clone();
+        let model_handler = self.model_handler.clone();
 
         let handle = tokio::spawn(async move {
-            let res = run_job_execution(pool, config, job, lease, event_tx, &mut stop_rx).await;
+            let res = run_job_execution(
+                pool,
+                config,
+                job,
+                lease,
+                event_tx,
+                &mut stop_rx,
+                (action_handler, model_handler),
+            )
+            .await;
             active_counter.fetch_sub(1, Ordering::SeqCst);
             if let Err(e) = res {
                 error!("Job execution task failed: {e}");
@@ -142,10 +180,8 @@ impl RuntimeSupervisor {
                    SELECT 1 FROM run_execution_leases l
                    WHERE l.run_id = r.id
                      AND l.released_at IS NULL
-                     AND l.expires_at > ?
                )",
         )
-        .bind(chrono::Utc::now().to_rfc3339())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -159,6 +195,19 @@ impl RuntimeSupervisor {
             let correlation_id: String = row.get(3);
             let causation_id: Option<String> = row.get(4);
             let company_id = nalarvo_domain::CompanyId(company_id_str);
+
+            if nalarvo_persistence::m4::recover_orphaned_approval(
+                &self.pool,
+                &company_id,
+                &run_id,
+                &self.config.worker_principal_id,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            {
+                reconciled += 1;
+                continue;
+            }
 
             let result = RuntimeResult {
                 id: Uuid::now_v7().to_string(),
@@ -244,10 +293,25 @@ impl SupervisorHandle {
     }
 }
 
-pub fn start_runtime_supervisor(pool: SqlitePool, config: SupervisorConfig) -> SupervisorHandle {
+pub fn start_runtime_supervisor_with_handler(
+    pool: SqlitePool,
+    config: SupervisorConfig,
+    action_handler: Option<crate::worker::ActionProposalHandler>,
+) -> SupervisorHandle {
+    start_runtime_supervisor_with_handlers(pool, config, action_handler, None)
+}
+
+pub fn start_runtime_supervisor_with_handlers(
+    pool: SqlitePool,
+    config: SupervisorConfig,
+    action_handler: Option<crate::worker::ActionProposalHandler>,
+    model_handler: Option<crate::worker::ModelRequestHandler>,
+) -> SupervisorHandle {
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let handle = tokio::spawn(async move {
-        let supervisor = RuntimeSupervisor::new(pool, config);
+        let mut supervisor = RuntimeSupervisor::new(pool, config);
+        supervisor.action_handler = action_handler;
+        supervisor.model_handler = model_handler;
         let _ = supervisor.reconcile_orphaned_runs().await;
         let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
         loop {
@@ -268,6 +332,10 @@ pub fn start_runtime_supervisor(pool: SqlitePool, config: SupervisorConfig) -> S
     SupervisorHandle { handle, stop_tx }
 }
 
+pub fn start_runtime_supervisor(pool: SqlitePool, config: SupervisorConfig) -> SupervisorHandle {
+    start_runtime_supervisor_with_handler(pool, config, None)
+}
+
 async fn run_job_execution(
     pool: SqlitePool,
     config: SupervisorConfig,
@@ -275,7 +343,12 @@ async fn run_job_execution(
     lease: ExecutionLease,
     event_tx: Option<mpsc::Sender<RuntimeStreamEvent>>,
     stop_rx: &mut watch::Receiver<bool>,
+    handlers: (
+        Option<crate::worker::ActionProposalHandler>,
+        Option<crate::worker::ModelRequestHandler>,
+    ),
 ) -> Result<(), String> {
+    let (action_handler, model_handler) = handlers;
     if *stop_rx.borrow() {
         return Ok(());
     }
@@ -286,19 +359,116 @@ async fn run_job_execution(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Run {} not found", job.run_id))?;
 
-    // Start Run: QUEUED -> RUNNING
-    let run_running = transition_run_with_lease(
-        &pool,
-        &lease,
-        company_id,
-        &run.id,
-        run.row_version,
-        RunStatus::Running,
-        None,
-        None,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    // Only an approved checkpoint may resume; a pending decision is never a job.
+    let resume_proposal = if matches!(run.status, RunStatus::Queued | RunStatus::WaitingApproval) {
+        let checkpoint = nalarvo_persistence::m4::approval_checkpoint(&pool, company_id, &run.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(checkpoint) = checkpoint {
+            if checkpoint.run_state != "WAITING_APPROVAL"
+                || !checkpoint.safe_to_resume
+                || checkpoint.execution_phase != "APPROVAL_PENDING"
+            {
+                return Err("Unsafe approval checkpoint".into());
+            }
+            let metadata = checkpoint
+                .continuation_metadata
+                .ok_or("Approval checkpoint has no continuation")?;
+            let proposal: ToolProposal = serde_json::from_value(
+                metadata
+                    .get("proposal")
+                    .cloned()
+                    .ok_or("Approval checkpoint has no proposal")?,
+            )
+            .map_err(|e| format!("Invalid checkpoint proposal: {e}"))?;
+            let step_id = metadata
+                .get("step_id")
+                .and_then(|v| v.as_str())
+                .ok_or("Approval checkpoint has no step")?;
+            let action_id = metadata
+                .get("action_id")
+                .and_then(|v| v.as_str())
+                .ok_or("Approval checkpoint has no action")?;
+            let approval_id = metadata
+                .get("approval_id")
+                .and_then(|v| v.as_str())
+                .ok_or("Approval checkpoint has no approval")?;
+            let fingerprint = metadata
+                .get("fingerprint")
+                .and_then(|v| v.as_str())
+                .ok_or("Approval checkpoint has no fingerprint")?;
+            let idempotency_key = metadata
+                .get("idempotency_key")
+                .and_then(|v| v.as_str())
+                .ok_or("Approval checkpoint has no idempotency")?;
+            let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions a JOIN approval_requests p ON p.action_id=a.id JOIN domain_events e ON e.aggregate_id=a.id AND e.event_type='ActionProposed' WHERE a.id=? AND a.company_id=? AND a.run_id=? AND a.step_id=? AND a.idempotency_key=? AND json_extract(e.payload,'$.fingerprint')=? AND a.authorization='APPROVED' AND a.status='PENDING' AND p.id=? AND p.status='APPROVED'")
+                .bind(action_id).bind(&company_id.0).bind(&run.id).bind(step_id)
+                .bind(idempotency_key).bind(fingerprint).bind(approval_id)
+                .fetch_one(&pool).await.map_err(|e| e.to_string())?;
+            if bound != 1 {
+                return Err("Approval checkpoint no longer authorized".into());
+            }
+            let parameters: String =
+                sqlx::query_scalar("SELECT input FROM actions WHERE id=? AND company_id=?")
+                    .bind(action_id)
+                    .bind(&company_id.0)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let cmd = nalarvo_application::ProposeActionCommand {
+                company_id: company_id.0.clone(),
+                project_id: Some(run.project_id.clone()),
+                run_id: Some(run.id.clone()),
+                step_id: Some(step_id.into()),
+                actor: PrincipalRef::system(&lease.worker_principal_id),
+                action_type: proposal.tool_name.clone(),
+                target: proposal.target.clone(),
+                parameters: Some(serde_json::from_str(&parameters).map_err(|e| e.to_string())?),
+                idempotency_key: Some(idempotency_key.into()),
+                meta: nalarvo_application::CommandMeta {
+                    principal: None,
+                    idempotency_key: None,
+                    correlation_id: Some(run.correlation_id.clone()),
+                    causation_id: Some(approval_id.into()),
+                },
+            };
+            let resumed = nalarvo_application::ApplicationContext::new(pool.clone())
+                .resume_approved_runtime_action(
+                    &cmd,
+                    action_id,
+                    approval_id,
+                    &lease,
+                    run.row_version,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Some((proposal, resumed))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let (resume_proposal, run_running) = if let Some((proposal, resumed)) = resume_proposal {
+        (Some(proposal), resumed)
+    } else {
+        if run.status == RunStatus::WaitingApproval {
+            return Err("Missing authorized approval continuation".into());
+        }
+        let running = transition_run_with_lease(
+            &pool,
+            &lease,
+            company_id,
+            &run.id,
+            run.row_version,
+            RunStatus::Running,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        (None, running)
+    };
 
     let context_input = crate::context::ContextInput {
         company_id: company_id.0.clone(),
@@ -334,22 +504,36 @@ async fn run_job_execution(
         "MALFORMED_RESPONSE" => MockMode::MALFORMED_RESPONSE,
         "PROVIDER_UNAVAILABLE" => MockMode::PROVIDER_UNAVAILABLE,
         "CANCELLED" => MockMode::CANCELLED,
+        "TOOL_PROPOSAL" => MockMode::TOOL_PROPOSAL,
         _ => MockMode::SUCCESS_TEXT,
     };
 
-    let provider_connection_id = job
-        .payload
-        .get("provider_connection_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("provider-conn-default")
-        .to_string();
-
-    let model_key = job
-        .payload
-        .get("model_key")
-        .and_then(|v| v.as_str())
-        .unwrap_or("gpt-4o-mini")
-        .to_string();
+    let canonical_model: Option<(String, String)> = if model_handler.is_some() {
+        sqlx::query_as("SELECT m.provider_connection_id,m.model_key FROM runs r JOIN companies c ON c.id=r.company_id JOIN agents a ON a.id=r.executing_agent_id AND a.company_id=r.company_id JOIN model_profiles mp ON mp.workspace_id=c.workspace_id AND (mp.id=COALESCE(r.model_profile_version_id,a.model_profile_id) OR mp.id||':'||mp.current_version=COALESCE(r.model_profile_version_id,a.model_profile_id)) JOIN model_profile_versions pv ON pv.profile_id=mp.id AND pv.workspace_id=mp.workspace_id AND pv.version=mp.current_version JOIN models m ON m.id=pv.model_id AND m.workspace_id=pv.workspace_id WHERE r.id=? AND r.company_id=?")
+            .bind(&run_running.id).bind(&company_id.0).fetch_optional(&pool).await.map_err(|e|e.to_string())?
+    } else {
+        None
+    };
+    let provider_connection_id = canonical_model
+        .as_ref()
+        .map(|v| v.0.clone())
+        .unwrap_or_else(|| {
+            job.payload
+                .get("provider_connection_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("provider-conn-default")
+                .into()
+        });
+    let model_key = canonical_model
+        .as_ref()
+        .map(|v| v.1.clone())
+        .unwrap_or_else(|| {
+            job.payload
+                .get("model_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("gpt-4o-mini")
+                .into()
+        });
 
     let base_url = job
         .payload
@@ -357,13 +541,29 @@ async fn run_job_execution(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let auth_token = job
-        .payload
-        .get("auth_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    let lease_version = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(lease.lease_version));
+    let live_lease_version = std::sync::Arc::new(tokio::sync::RwLock::new(lease.lease_version));
+    let action_handler = action_handler.map(|handler| {
+        let version = lease_version.clone();
+        let live = live_lease_version.clone();
+        std::sync::Arc::new(
+            move |mut ctx: crate::core_dispatch::TrustedRunContext, proposal| {
+                ctx.lease_version = version.load(std::sync::atomic::Ordering::SeqCst);
+                ctx.live_lease_version = Some(live.clone());
+                handler(ctx, proposal)
+            },
+        ) as crate::worker::ActionProposalHandler
+    });
+    let model_handler = model_handler.map(|handler| {
+        let version = lease_version.clone();
+        std::sync::Arc::new(
+            move |mut ctx: crate::core_dispatch::TrustedRunContext, request, cancel| {
+                ctx.lease_version = version.load(std::sync::atomic::Ordering::SeqCst);
+                handler(ctx, request, cancel)
+            },
+        ) as crate::worker::ModelRequestHandler
+    });
     let exec_req = RunExecutionRequest {
         run_id: run_running.id.clone(),
         company_id: company_id.0.clone(),
@@ -373,7 +573,7 @@ async fn run_job_execution(
         model_profile_version_id: run_running.model_profile_version_id.clone(),
         provider_connection_id: provider_connection_id.clone(),
         base_url,
-        auth_token,
+        auth_token: None,
         model_key: model_key.clone(),
         context_input,
         worker_principal_id: config.worker_principal_id.clone(),
@@ -383,6 +583,9 @@ async fn run_job_execution(
         expected_run_version: run_running.row_version,
         mock_mode,
         cancel_rx: Some(cancel_rx),
+        action_handler,
+        model_handler,
+        resume_proposal,
     };
 
     let worker_bin = resolve_worker_executable()?;
@@ -406,6 +609,7 @@ async fn run_job_execution(
         }
     };
     tokio::pin!(deadline);
+    let exec_uses_governed_step = exec_req.action_handler.is_some();
     let execution = execute_run_worker_process(&worker_bin, exec_req, event_tx);
     tokio::pin!(execution);
     let outcome = loop {
@@ -420,11 +624,15 @@ async fn run_job_execution(
                 }
             }
             _ = ticks.tick() => {
+                // Execution is polled by this select. Never block it on its own guard.
+                let Ok(mut live)=live_lease_version.try_write() else { continue; };
                 lease = heartbeat_lease(
                     &pool, &lease.id, &lease.worker_principal_id, lease.lease_version,
                     chrono::Duration::seconds(config.lease_duration_secs),
                 ).await.map_err(|e| e.to_string())?
                     .ok_or_else(|| format!("Execution lease {} expired or was preempted", lease.id))?;
+                lease_version.store(lease.lease_version, std::sync::atomic::Ordering::SeqCst);
+                *live=lease.lease_version;
             }
             _ = controls.tick() => {
                 let current = get_run(&pool, company_id, &run_running.id)
@@ -447,103 +655,121 @@ async fn run_job_execution(
             }
         }
     };
+    if outcome.status == RunStatus::WaitingApproval {
+        return suspend_approval(&pool, &lease, &run_running, &job).await;
+    }
     ensure_current_lease(&pool, &lease).await?;
 
-    // Append Context Step Record
-    let context_step = ExecutionStep {
-        id: Uuid::now_v7().to_string(),
-        company_id: company_id.clone(),
-        run_id: run_running.id.clone(),
-        sequence_no: 1,
-        step_type: "CONTEXT_PREP".into(),
-        status: outcome.context_step_status,
-        parent_step_id: None,
-        input_metadata: None,
-        output_metadata: Some(serde_json::json!({ "context_bytes": 512 })),
-        failure_class: None,
-        failure_detail: None,
-        started_at: Some(chrono::Utc::now()),
-        completed_at: Some(chrono::Utc::now()),
-        created_at: chrono::Utc::now(),
-    };
-    let _ = append_step_with_lease(&pool, &lease, &context_step).await;
-
-    // Append Model Step & Invocation Record
-    let model_step = ExecutionStep {
-        id: Uuid::now_v7().to_string(),
-        company_id: company_id.clone(),
-        run_id: run_running.id.clone(),
-        sequence_no: 2,
-        step_type: "MODEL_CALL".into(),
-        status: outcome.model_step_status,
-        parent_step_id: Some(context_step.id.clone()),
-        input_metadata: None,
-        output_metadata: outcome
-            .output_text
-            .as_ref()
-            .map(|t| serde_json::json!({ "length": t.len() })),
-        failure_class: outcome.failure_class.clone(),
-        failure_detail: outcome.failure_detail.clone(),
-        started_at: Some(chrono::Utc::now()),
-        completed_at: Some(chrono::Utc::now()),
-        created_at: chrono::Utc::now(),
-    };
-    let _ = append_step_with_lease(&pool, &lease, &model_step).await;
-
-    let inv_id = Uuid::now_v7().to_string();
-    let invocation = ModelInvocation {
-        id: inv_id.clone(),
-        company_id: company_id.clone(),
-        run_id: run_running.id.clone(),
-        step_id: model_step.id.clone(),
-        agent_id: run_running.executing_agent_id.clone(),
-        provider_connection_id: provider_connection_id.clone(),
-        model_id: model_key.clone(),
-        model_profile_version_id: run_running.model_profile_version_id.clone(),
-        invocation_index: 1,
-        status: if outcome.status == RunStatus::Succeeded {
-            "SUCCEEDED".into()
-        } else {
-            "FAILED".into()
-        },
-        request_metadata: Some(serde_json::json!({ "model": model_key })),
-        response_metadata: outcome
-            .output_text
-            .as_ref()
-            .map(|t| serde_json::json!({ "summary": t.chars().take(50).collect::<String>() })),
-        input_tokens: outcome.input_tokens,
-        output_tokens: outcome.output_tokens,
-        estimated_cost: Some(0.0001),
-        latency_ms: outcome.latency_ms,
-        provider_request_id: Some(Uuid::now_v7().to_string()),
-        started_at: chrono::Utc::now(),
-        completed_at: Some(chrono::Utc::now()),
-        failure_class: outcome.failure_class.clone(),
-        failure_detail: outcome.failure_detail.clone(),
-    };
-    let _ = append_invocation_with_lease(&pool, &lease, &invocation).await;
-
-    // Append Usage Record
-    if let (Some(in_t), Some(out_t)) = (outcome.input_tokens, outcome.output_tokens) {
-        let usage = UsageRecord {
+    if exec_uses_governed_step {
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| e.to_string())?;
+        nalarvo_persistence::m4::require_current_lease_tx(&mut tx, &lease)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query("UPDATE execution_steps SET lifecycle_state=?,completed_at=?,failure_class=?,failure_detail=? WHERE run_id=? AND company_id=? AND step_type='TOOL_OPERATION' AND lifecycle_state='RUNNING'")
+            .bind(outcome.model_step_status.to_string()).bind(chrono::Utc::now().to_rfc3339())
+            .bind(&outcome.failure_class).bind(&outcome.failure_detail)
+            .bind(&run_running.id).bind(&company_id.0).execute(&mut *tx).await.map_err(|e|e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+    } else {
+        // Append Context Step Record
+        let context_step = ExecutionStep {
             id: Uuid::now_v7().to_string(),
-            workspace_id: "workspace-1".into(),
             company_id: company_id.clone(),
-            project_id: run_running.project_id.clone(),
-            work_item_id: run_running.work_item_id.clone(),
-            agent_id: run_running.executing_agent_id.clone(),
             run_id: run_running.id.clone(),
-            step_id: Some(model_step.id.clone()),
+            sequence_no: 1,
+            step_type: "CONTEXT_PREP".into(),
+            status: outcome.context_step_status,
+            parent_step_id: None,
+            input_metadata: None,
+            output_metadata: Some(serde_json::json!({ "context_bytes": 512 })),
+            failure_class: None,
+            failure_detail: None,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+        };
+        let _ = append_step_with_lease(&pool, &lease, &context_step).await;
+
+        // Append Model Step & Invocation Record
+        let model_step = ExecutionStep {
+            id: Uuid::now_v7().to_string(),
+            company_id: company_id.clone(),
+            run_id: run_running.id.clone(),
+            sequence_no: 2,
+            step_type: "MODEL_CALL".into(),
+            status: outcome.model_step_status,
+            parent_step_id: Some(context_step.id.clone()),
+            input_metadata: None,
+            output_metadata: outcome
+                .output_text
+                .as_ref()
+                .map(|t| serde_json::json!({ "length": t.len() })),
+            failure_class: outcome.failure_class.clone(),
+            failure_detail: outcome.failure_detail.clone(),
+            started_at: Some(chrono::Utc::now()),
+            completed_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+        };
+        let _ = append_step_with_lease(&pool, &lease, &model_step).await;
+
+        let inv_id = Uuid::now_v7().to_string();
+        let invocation = ModelInvocation {
+            id: inv_id.clone(),
+            company_id: company_id.clone(),
+            run_id: run_running.id.clone(),
+            step_id: model_step.id.clone(),
+            agent_id: run_running.executing_agent_id.clone(),
             provider_connection_id: provider_connection_id.clone(),
             model_id: model_key.clone(),
-            usage_type: "TOKENS".into(),
-            quantity: in_t + out_t,
-            unit: "TOKENS".into(),
+            model_profile_version_id: run_running.model_profile_version_id.clone(),
+            invocation_index: 1,
+            status: if outcome.status == RunStatus::Succeeded {
+                "SUCCEEDED".into()
+            } else {
+                "FAILED".into()
+            },
+            request_metadata: Some(serde_json::json!({ "model": model_key })),
+            response_metadata: outcome
+                .output_text
+                .as_ref()
+                .map(|t| serde_json::json!({ "summary": t.chars().take(50).collect::<String>() })),
+            input_tokens: outcome.input_tokens,
+            output_tokens: outcome.output_tokens,
             estimated_cost: Some(0.0001),
-            occurred_at: chrono::Utc::now(),
-            metadata: Some(serde_json::json!({ "input": in_t, "output": out_t })),
+            latency_ms: outcome.latency_ms,
+            provider_request_id: Some(Uuid::now_v7().to_string()),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            failure_class: outcome.failure_class.clone(),
+            failure_detail: outcome.failure_detail.clone(),
         };
-        let _ = append_usage_with_lease(&pool, &lease, &usage).await;
+        let _ = append_invocation_with_lease(&pool, &lease, &invocation).await;
+
+        // Append Usage Record
+        if let (Some(in_t), Some(out_t)) = (outcome.input_tokens, outcome.output_tokens) {
+            let usage = UsageRecord {
+                id: Uuid::now_v7().to_string(),
+                workspace_id: "workspace-1".into(),
+                company_id: company_id.clone(),
+                project_id: run_running.project_id.clone(),
+                work_item_id: run_running.work_item_id.clone(),
+                agent_id: run_running.executing_agent_id.clone(),
+                run_id: run_running.id.clone(),
+                step_id: Some(model_step.id.clone()),
+                provider_connection_id: provider_connection_id.clone(),
+                model_id: model_key.clone(),
+                usage_type: "TOKENS".into(),
+                quantity: in_t + out_t,
+                unit: "TOKENS".into(),
+                estimated_cost: Some(0.0001),
+                occurred_at: chrono::Utc::now(),
+                metadata: Some(serde_json::json!({ "input": in_t, "output": out_t })),
+            };
+            let _ = append_usage_with_lease(&pool, &lease, &usage).await;
+        }
     }
 
     let result_rec = RuntimeResult {
@@ -611,6 +837,113 @@ async fn run_job_execution(
     .map_err(|e| e.to_string())?;
     let _ = release_current_lease(&pool, &lease, "COMPLETED").await;
 
+    Ok(())
+}
+
+async fn suspend_approval(
+    pool: &SqlitePool,
+    lease: &ExecutionLease,
+    run: &nalarvo_domain::Run,
+    job: &DurableJob,
+) -> Result<(), String> {
+    let row = sqlx::query("SELECT a.id,a.step_id,a.action_type,a.target,a.input,a.idempotency_key,p.id AS approval_id,(SELECT payload FROM domain_events WHERE aggregate_id=a.id AND event_type='ActionProposed' ORDER BY rowid LIMIT 1) AS proposed_payload FROM actions a JOIN approval_requests p ON p.action_id=a.id WHERE a.run_id=? AND a.company_id=? AND a.authorization='APPROVAL_REQUIRED' AND p.status='PENDING' ORDER BY a.created_at DESC LIMIT 1")
+        .bind(&run.id).bind(&run.company_id.0).fetch_optional(pool).await
+        .map_err(|e| e.to_string())?.ok_or("Missing pending approval action")?;
+    let step_id: String = row.try_get("step_id").map_err(|e| e.to_string())?;
+    let action_id: String = row.get("id");
+    let idempotency_key: String = row.try_get("idempotency_key").map_err(|e| e.to_string())?;
+    let call_id = idempotency_key
+        .split(':')
+        .nth(3)
+        .ok_or("Invalid tool idempotency")?;
+    let mut arguments: serde_json::Value =
+        serde_json::from_str(&row.get::<String, _>("input")).map_err(|e| e.to_string())?;
+    let tool_name = arguments
+        .get("tool_id")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing tool identity")?
+        .to_string();
+    for key in [
+        "tool_id",
+        "tool_version",
+        "worker_principal_id",
+        "root_binding",
+        "filesystem_binding",
+        "shell_binding",
+        "provider_connection_id",
+    ] {
+        arguments
+            .as_object_mut()
+            .ok_or("Invalid tool arguments")?
+            .remove(key);
+    }
+    let proposal = ToolProposal {
+        call_id: Some(call_id.into()),
+        tool_name,
+        target: row.get("target"),
+        arguments,
+    };
+    let sequence: i64 =
+        sqlx::query_scalar("SELECT sequence_no FROM execution_steps WHERE id=? AND run_id=?")
+            .bind(&step_id)
+            .bind(&run.id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let approval_id: String = row.get("approval_id");
+    let proposed_payload: serde_json::Value =
+        serde_json::from_str(&row.get::<String, _>("proposed_payload"))
+            .map_err(|e| e.to_string())?;
+    let fingerprint = proposed_payload
+        .get("fingerprint")
+        .and_then(|v| v.as_str())
+        .ok_or("Approval fingerprint missing")?;
+    let checkpoint = nalarvo_persistence::m4::RuntimeCheckpoint {
+        id: Uuid::now_v7().to_string(),
+        company_id: run.company_id.clone(),
+        run_id: run.id.clone(),
+        checkpoint_version: 1,
+        run_state: "WAITING_APPROVAL".into(),
+        last_completed_step: None,
+        active_step: Some(sequence),
+        execution_phase: "APPROVAL_PENDING".into(),
+        context_refs: Some(
+            serde_json::json!({"job_id":job.id,"correlation_id":run.correlation_id}),
+        ),
+        continuation_metadata: Some(serde_json::json!({
+            "proposal":proposal,"step_id":step_id,"action_id":action_id,
+            "approval_id":approval_id,"fingerprint":fingerprint,
+            "original_worker_principal_id":lease.worker_principal_id,
+            "idempotency_key":idempotency_key,
+        })),
+        usage_snapshot: None,
+        safe_to_resume: true,
+    };
+    let event = DomainEvent {
+        event_id: Uuid::now_v7().to_string(),
+        event_type: "RunWaitingApproval".into(),
+        schema_version: 1,
+        company_id: run.company_id.clone(),
+        aggregate_type: "Run".into(),
+        aggregate_id: run.id.clone(),
+        aggregate_version: run.row_version + 1,
+        occurred_at: chrono::Utc::now(),
+        correlation_id: run.correlation_id.clone(),
+        causation_id: approval_id,
+        principal: PrincipalRef::system(&lease.worker_principal_id),
+        scope: ScopeRef::company(&run.company_id.0),
+        payload: serde_json::json!({"run_id":run.id,"status":"WAITING_APPROVAL","action_id":action_id}),
+    };
+    nalarvo_persistence::m4::suspend_for_approval(
+        pool,
+        lease,
+        &run.company_id,
+        run.row_version,
+        &checkpoint,
+        &event,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

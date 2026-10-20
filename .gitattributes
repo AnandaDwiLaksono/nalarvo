@@ -1,3 +1,5 @@
 * text=auto eol=lf
 *.png binary
 *.ico binary
+# Preserve published 0012 bytes: its historical trailing space is part of SQLx SHA-384.
+/migrations/0012_governance.sql whitespace=-blank-at-eol

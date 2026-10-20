@@ -34,6 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             expected_run_version: 1,
             mock_mode: MockMode::SUCCESS_TEXT,
             cancel_rx: None,
+            action_handler: None,
+            model_handler: None,
+            resume_proposal: None,
         };
 
         let outcome = execute_run_worker(req, None).await;

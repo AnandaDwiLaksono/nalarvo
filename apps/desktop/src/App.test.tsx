@@ -15,6 +15,69 @@ import App from "./App";
 beforeEach(() => invoke.mockReset());
 afterEach(() => cleanup());
 
+test.each([true, false])(
+  "submits the inbox Action fingerprint when approved=%s",
+  async (approved) => {
+    let status = "PENDING";
+    const fingerprint = "a".repeat(64);
+    invoke.mockImplementation(async (command: string, args) => {
+      if (command === "core_health") return { status: "ok" };
+      if (command === "core_get_workspace")
+        return {
+          id: "w",
+          owner_user_id: "owner",
+          name: "Workspace",
+          lifecycle_state: "ACTIVE",
+        };
+      if (command === "core_list_providers") return { providers: [] };
+      if (command === "core_list_companies")
+        return { companies: [{ id: "c", name: "Company", status: "ACTIVE" }] };
+      if (command === "core_list_departments") return { departments: [] };
+      if (command === "core_list_roles") return { roles: [] };
+      if (command === "core_list_agents") return { agents: [] };
+      if (command === "core_list_projects") return { projects: [] };
+      if (command === "core_list_approvals")
+        return [
+          {
+            id: "approval",
+            action_id: "action",
+            company_id: "c",
+            status,
+            fingerprint,
+            requested_by_id: "agent",
+            requested_at: "now",
+          },
+        ];
+      if (command === "core_decide_approval") {
+        expect(args.payload.fingerprint).toBe(fingerprint);
+        expect(args.payload.decided_by_id).toBe("owner");
+        expect(args.payload.approved).toBe(approved);
+        status = approved ? "APPROVED" : "REJECTED";
+      }
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Approvals" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: approved ? "Approve" : "Reject",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(new RegExp(`Status: ${status}`)),
+      ).toBeInTheDocument(),
+    );
+    expect(invoke).toHaveBeenCalledWith(
+      "core_decide_approval",
+      expect.objectContaining({
+        companyId: "c",
+        approvalId: "approval",
+        payload: expect.objectContaining({ fingerprint, approved }),
+      }),
+    );
+  },
+);
+
 test("shows workspace provider settings and isolated workforce controls", async () => {
   invoke.mockImplementation(async (command?: string) => {
     if (command === "core_health")

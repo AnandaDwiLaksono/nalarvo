@@ -1,6 +1,8 @@
 use clap::Parser;
 use nalarvo_application::{ApplicationContext, start_outbox_dispatcher};
-use nalarvo_runtime::{SupervisorConfig, start_runtime_supervisor};
+use nalarvo_runtime::{
+    SupervisorConfig, core_dispatch, core_model, start_runtime_supervisor_with_handlers,
+};
 use nalarvo_secret_store_windows::WindowsCredentialStore;
 use rand::Rng;
 use std::{net::SocketAddr, sync::Arc};
@@ -21,6 +23,9 @@ struct Args {
         default_value = "sqlite://data.sqlite?mode=rwc"
     )]
     db_url: String,
+    /// Trusted operator JSON: [{"executable":"C:\\...\\tool.exe","args":["--version"],"timeout_ms":5000}].
+    #[arg(long, env = "NALARVO_SHELL_ALLOWLIST", default_value = "[]")]
+    shell_allowlist: String,
 }
 
 #[tokio::main]
@@ -34,10 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.bind.ip().is_loopback() {
         return Err("Nalarvo Core must bind loopback only".into());
     }
+    let shell = nalarvo_runtime::shell::ShellPolicy::from_json(&args.shell_allowlist)?;
 
     let token = args.token.unwrap_or_else(new_token);
 
-    // Initialize application context with Windows secret store and run migrations
+    // Initialize SQLite durable M5 audit + tracing diagnostics and Windows secret store.
     let app_ctx =
         ApplicationContext::init_with_secret_store(&args.db_url, Arc::new(WindowsCredentialStore))
             .await?;
@@ -45,8 +51,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start background outbox dispatcher
     let dispatcher = start_outbox_dispatcher(app_ctx.clone(), 500, "daemon-dispatcher".into());
 
-    // Start background runtime supervisor
-    let supervisor = start_runtime_supervisor(app_ctx.pool.clone(), SupervisorConfig::default());
+    // Core resolves each tool root from the trusted Run -> Project binding.
+    let action_handler = core_dispatch::handler_with_shell(app_ctx.clone(), shell);
+
+    // Both model authentication and tool authority remain in trusted Core.
+    let supervisor = start_runtime_supervisor_with_handlers(
+        app_ctx.pool.clone(),
+        SupervisorConfig::default(),
+        Some(action_handler),
+        Some(core_model::handler(app_ctx.clone())),
+    );
 
     let listener = TcpListener::bind(args.bind).await?;
     if args.emit_token {
@@ -75,4 +89,19 @@ fn new_token() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_configuration_is_explicit_and_default_deny() {
+        let args = Args::try_parse_from(["nalarvo-daemon"]).unwrap();
+        assert_eq!(args.shell_allowlist, "[]");
+        assert!(nalarvo_runtime::shell::ShellPolicy::from_json(&args.shell_allowlist).is_ok());
+        let args =
+            Args::try_parse_from(["nalarvo-daemon", "--shell-allowlist", "not-json"]).unwrap();
+        assert!(nalarvo_runtime::shell::ShellPolicy::from_json(&args.shell_allowlist).is_err());
+    }
 }

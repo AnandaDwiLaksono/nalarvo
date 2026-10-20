@@ -163,6 +163,9 @@ async fn test_renderer_stream_receiver_drop_does_not_cancel_execution() {
         expected_run_version: 1,
         mock_mode: MockMode::SUCCESS_TEXT,
         cancel_rx: None,
+        action_handler: None,
+        model_handler: None,
+        resume_proposal: None,
     };
 
     let outcome = execute_run_worker(req, Some(tx)).await;
@@ -195,6 +198,9 @@ async fn test_cooperative_cancellation() {
         expected_run_version: 1,
         mock_mode: MockMode::DELAYED_SUCCESS,
         cancel_rx: Some(cancel_rx),
+        action_handler: None,
+        model_handler: None,
+        resume_proposal: None,
     };
 
     let outcome = execute_run_worker(req, None).await;
@@ -225,6 +231,9 @@ async fn test_provider_timeout_leads_to_failed_status() {
         expected_run_version: 1,
         mock_mode: MockMode::TIMEOUT,
         cancel_rx: None,
+        action_handler: None,
+        model_handler: None,
+        resume_proposal: None,
     };
 
     let outcome = execute_run_worker(req, None).await;
@@ -308,6 +317,9 @@ async fn test_output_bounds_and_truncation() {
         expected_run_version: 1,
         mock_mode: MockMode::SUCCESS_TEXT,
         cancel_rx: None,
+        action_handler: None,
+        model_handler: None,
+        resume_proposal: None,
     };
 
     let outcome = execute_run_worker(req, None).await;
@@ -381,8 +393,14 @@ async fn test_bounded_capacity_and_duplicate_dispatch() {
     );
     assert_eq!(supervisor.current_active_count(), 1);
 
-    // Wait for job 1 to complete in tokio task
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait for real child completion, not a fixed process-startup estimate.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while supervisor.current_active_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("job 1 completed");
     assert_eq!(supervisor.current_active_count(), 0);
 
     // Now poll again -> job 2 is claimed
@@ -399,7 +417,13 @@ async fn test_bounded_capacity_and_duplicate_dispatch() {
         .expect("poll dup");
     assert!(!claimed_dup, "Duplicate claim should find no available job");
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while supervisor.current_active_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("job 2 completed");
     assert_eq!(supervisor.current_active_count(), 0);
 }
 
@@ -427,6 +451,9 @@ async fn test_stream_event_delivery() {
         expected_run_version: 1,
         mock_mode: MockMode::SUCCESS_TEXT,
         cancel_rx: None,
+        action_handler: None,
+        model_handler: None,
+        resume_proposal: None,
     };
 
     let _outcome = execute_run_worker(req, Some(tx)).await;

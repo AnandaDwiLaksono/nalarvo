@@ -44,6 +44,7 @@ use std::{convert::Infallible, sync::Arc};
 use tokio_stream::StreamExt;
 
 pub mod m4;
+pub mod m5;
 use tokio_stream::wrappers::BroadcastStream;
 
 #[derive(Clone)]
@@ -63,6 +64,38 @@ pub fn router_with_app(token: impl Into<Arc<str>>, app_ctx: Option<ApplicationCo
     };
 
     Router::new()
+        .route(
+            "/api/v1/companies/{company_id}/approvals",
+            get(m5::list_approvals_handler),
+        )
+        .route(
+            "/api/v1/companies/{company_id}/approvals/{approval_id}/decide",
+            post(m5::decide_approval_handler),
+        )
+        .route(
+            "/api/v1/companies/{company_id}/actions",
+            get(m5::list_actions_handler),
+        )
+        .route(
+            "/api/v1/companies/{company_id}/actions/{action_id}",
+            get(m5::get_action_handler),
+        )
+        .route(
+            "/api/v1/permission-definitions",
+            get(m5::list_permission_definitions_handler),
+        )
+        .route(
+            "/api/v1/companies/{company_id}/permission-grants",
+            get(m5::list_permission_grants_handler),
+        )
+        .route(
+            "/api/v1/companies/{company_id}/policies",
+            get(m5::list_policies_handler),
+        )
+        .route(
+            "/api/v1/companies/{company_id}/budgets",
+            get(m5::list_budgets_handler),
+        )
         .route("/api/v1/health", get(health))
         .route("/api/v1/workspace", get(get_workspace))
         .route(

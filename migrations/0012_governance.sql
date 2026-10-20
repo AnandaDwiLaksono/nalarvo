@@ -1,0 +1,42 @@
+-- Forward-only M5 governance persistence. No runtime/API/UI artifacts.
+CREATE TABLE permission_definitions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, name TEXT NOT NULL, resource TEXT NOT NULL, operation TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL, UNIQUE(workspace_id, name));
+CREATE TABLE permission_grants (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, company_id TEXT, permission_definition_id TEXT NOT NULL, principal_type TEXT NOT NULL, principal_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, effect TEXT NOT NULL, constraints TEXT, starts_at TEXT, expires_at TEXT, revoked_at TEXT, created_at TEXT NOT NULL, FOREIGN KEY(permission_definition_id) REFERENCES permission_definitions(id));
+CREATE INDEX idx_permission_grants_subject ON permission_grants(workspace_id, principal_type, principal_id);
+CREATE TABLE policies (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, company_id TEXT, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ACTIVE', current_version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(workspace_id, name));
+CREATE TABLE policy_versions (id TEXT PRIMARY KEY, policy_id TEXT NOT NULL, version INTEGER NOT NULL, rules TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(policy_id) REFERENCES policies(id) ON DELETE RESTRICT, UNIQUE(policy_id, version));
+CREATE TABLE authority_decisions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, company_id TEXT, action_id TEXT, principal_type TEXT NOT NULL, principal_id TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, policy_version TEXT, evaluated_at TEXT NOT NULL);
+CREATE TABLE authority_decision_policies (authority_decision_id TEXT NOT NULL, policy_id TEXT NOT NULL, policy_version_id TEXT, PRIMARY KEY(authority_decision_id, policy_id), FOREIGN KEY(authority_decision_id) REFERENCES authority_decisions(id) ON DELETE CASCADE, FOREIGN KEY(policy_id) REFERENCES policies(id));
+CREATE TABLE authority_decision_grants (authority_decision_id TEXT NOT NULL, permission_grant_id TEXT NOT NULL, PRIMARY KEY(authority_decision_id, permission_grant_id), FOREIGN KEY(authority_decision_id) REFERENCES authority_decisions(id) ON DELETE CASCADE, FOREIGN KEY(permission_grant_id) REFERENCES permission_grants(id));
+CREATE TABLE actions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, company_id TEXT NOT NULL, run_id TEXT, step_id TEXT, requested_by_type TEXT NOT NULL, requested_by_id TEXT NOT NULL, action_type TEXT NOT NULL, target TEXT NOT NULL, input TEXT, authorization TEXT NOT NULL DEFAULT 'PENDING', status TEXT NOT NULL DEFAULT 'PENDING', idempotency_key TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(run_id) REFERENCES runs(id), UNIQUE(company_id, idempotency_key));
+CREATE INDEX idx_actions_status ON actions(company_id, status);
+CREATE TABLE approval_requests (id TEXT PRIMARY KEY, action_id TEXT NOT NULL, workspace_id TEXT NOT NULL, company_id TEXT NOT NULL, requested_by_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING', reason TEXT, requested_at TEXT NOT NULL, decided_at TEXT, FOREIGN KEY(action_id) REFERENCES actions(id) ON DELETE RESTRICT);
+CREATE TABLE approval_decisions (id TEXT PRIMARY KEY, approval_request_id TEXT NOT NULL, decided_by_type TEXT NOT NULL, decided_by_id TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, decided_at TEXT NOT NULL, FOREIGN KEY(approval_request_id) REFERENCES approval_requests(id) ON DELETE RESTRICT);
+CREATE TABLE tool_invocations (id TEXT PRIMARY KEY, action_id TEXT, workspace_id TEXT NOT NULL, company_id TEXT NOT NULL, run_id TEXT, step_id TEXT, tool_name TEXT NOT NULL, status TEXT NOT NULL, request TEXT, response TEXT, failure_class TEXT, started_at TEXT NOT NULL, completed_at TEXT, FOREIGN KEY(action_id) REFERENCES actions(id) ON DELETE RESTRICT, FOREIGN KEY(run_id) REFERENCES runs(id));
+CREATE TABLE budgets (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, company_id TEXT NOT NULL, name TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', status TEXT NOT NULL DEFAULT 'ACTIVE', total_limit REAL NOT NULL, reserved_amount REAL NOT NULL DEFAULT 0, spent_amount REAL NOT NULL DEFAULT 0, starts_at TEXT, ends_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE budget_limits (id TEXT PRIMARY KEY, budget_id TEXT NOT NULL, resource_type TEXT NOT NULL, limit_amount REAL NOT NULL, reserved_amount REAL NOT NULL DEFAULT 0, spent_amount REAL NOT NULL DEFAULT 0, FOREIGN KEY(budget_id) REFERENCES budgets(id) ON DELETE CASCADE, UNIQUE(budget_id, resource_type));
+CREATE TABLE resource_reservations (id TEXT PRIMARY KEY, budget_id TEXT NOT NULL, action_id TEXT, workspace_id TEXT NOT NULL, company_id TEXT NOT NULL, resource_type TEXT NOT NULL, amount REAL NOT NULL, status TEXT NOT NULL DEFAULT 'HELD', expires_at TEXT, created_at TEXT NOT NULL, released_at TEXT, FOREIGN KEY(budget_id) REFERENCES budgets(id) ON DELETE RESTRICT, FOREIGN KEY(action_id) REFERENCES actions(id) ON DELETE RESTRICT);
+CREATE INDEX idx_resource_reservations_active ON resource_reservations(budget_id, status, expires_at);
+CREATE TABLE audit_records (audit_id TEXT PRIMARY KEY, action TEXT NOT NULL, principal_type TEXT NOT NULL, principal_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, occurred_at TEXT NOT NULL, details TEXT NOT NULL); 
+CREATE INDEX idx_audit_records_scope_occurred ON audit_records(scope_type, scope_id, occurred_at);
+-- Runtime provenance is mandatory at the application boundary; non-runtime Actions
+-- legitimately omit Run/Step. Keep existing public records compatible.
+ALTER TABLE actions ADD COLUMN project_id TEXT REFERENCES projects(id);
+ALTER TABLE actions ADD COLUMN work_item_id TEXT REFERENCES work_items(id);
+ALTER TABLE actions ADD COLUMN agent_id TEXT REFERENCES agents(id);
+ALTER TABLE actions ADD COLUMN worker_principal_id TEXT;
+ALTER TABLE actions ADD COLUMN tool_id TEXT;
+ALTER TABLE actions ADD COLUMN tool_version TEXT;
+ALTER TABLE actions ADD COLUMN fingerprint TEXT;
+ALTER TABLE actions ADD COLUMN correlation_id TEXT;
+ALTER TABLE actions ADD COLUMN causation_id TEXT;
+ALTER TABLE actions ADD COLUMN row_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE actions ADD COLUMN started_at TEXT;
+ALTER TABLE actions ADD COLUMN completed_at TEXT;
+ALTER TABLE actions ADD COLUMN result TEXT;
+ALTER TABLE tool_invocations ADD COLUMN project_id TEXT REFERENCES projects(id);
+ALTER TABLE tool_invocations ADD COLUMN tool_version TEXT;
+ALTER TABLE tool_invocations ADD COLUMN idempotency_key TEXT;
+CREATE UNIQUE INDEX idx_tool_invocation_action ON tool_invocations(action_id) WHERE action_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_approval_action ON approval_requests(action_id);
+CREATE UNIQUE INDEX idx_reservation_action_resource ON resource_reservations(budget_id,action_id,resource_type) WHERE action_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_tool_usage_action ON usage_records(json_extract(metadata,'$.action_id')) WHERE usage_type='TOOL_CALL';

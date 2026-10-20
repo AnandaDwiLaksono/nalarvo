@@ -18,6 +18,12 @@ async fn setup_app() -> (ApplicationContext, CompanyId, String, String, String) 
         .unwrap()
         .id;
 
+    sqlx::query("UPDATE companies SET status='ACTIVE' WHERE id=?")
+        .bind(&company_id.0)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
     for sql in [
         "INSERT INTO departments(id, company_id, name, created_at, updated_at) VALUES ('d1', ?, 'Engineering', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         "INSERT INTO roles(id, company_id, name, created_at, updated_at) VALUES ('r1', ?, 'Developer', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
@@ -81,6 +87,11 @@ async fn setup_app() -> (ApplicationContext, CompanyId, String, String, String) 
             nalarvo_domain::AgentAllocationStatus::Active,
             allocation.row_version,
         )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE teams SET status='ACTIVE' WHERE id=?")
+        .bind(&team.id)
+        .execute(&app.pool)
         .await
         .unwrap();
 

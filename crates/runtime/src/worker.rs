@@ -8,10 +8,15 @@ use nalarvo_model_gateway::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     fs::OpenOptions,
+    future::Future,
     io::Write,
     path::Path,
+    pin::Pin,
     process::Stdio,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -46,6 +51,7 @@ use tokio::{
 use tracing::info;
 
 static WORKER_PROCESS_SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WORKER_PROCESS_REAP_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PROVIDER_INVOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn worker_process_spawn_count() -> usize {
@@ -54,6 +60,11 @@ pub fn worker_process_spawn_count() -> usize {
 
 pub fn reset_worker_process_spawn_count() {
     WORKER_PROCESS_SPAWN_COUNT.store(0, Ordering::SeqCst);
+    WORKER_PROCESS_REAP_COUNT.store(0, Ordering::SeqCst);
+}
+
+pub fn worker_process_reap_count() -> usize {
+    WORKER_PROCESS_REAP_COUNT.load(Ordering::SeqCst)
 }
 
 pub fn provider_invocation_count() -> usize {
@@ -77,7 +88,26 @@ pub enum RuntimeStreamEvent {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+pub type ActionProposalHandler = Arc<
+    dyn Fn(
+            crate::core_dispatch::TrustedRunContext,
+            ToolProposal,
+        ) -> Pin<Box<dyn Future<Output = Result<WorkerExecutionOutcome, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub type ModelRequestHandler = Arc<
+    dyn Fn(
+            crate::core_dispatch::TrustedRunContext,
+            ModelRequest,
+            watch::Receiver<bool>,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse, ProviderError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
 pub struct RunExecutionRequest {
     pub run_id: String,
     pub company_id: String,
@@ -97,6 +127,35 @@ pub struct RunExecutionRequest {
     pub expected_run_version: i64,
     pub mock_mode: MockMode,
     pub cancel_rx: Option<watch::Receiver<bool>>,
+    pub action_handler: Option<ActionProposalHandler>,
+    pub model_handler: Option<ModelRequestHandler>,
+    pub resume_proposal: Option<ToolProposal>,
+}
+
+impl std::fmt::Debug for RunExecutionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunExecutionRequest")
+            .field("run_id", &self.run_id)
+            .field("company_id", &self.company_id)
+            .field("project_id", &self.project_id)
+            .field("work_item_id", &self.work_item_id)
+            .field("agent_id", &self.agent_id)
+            .field("model_profile_version_id", &self.model_profile_version_id)
+            .field("provider_connection_id", &self.provider_connection_id)
+            .field("base_url", &self.base_url)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("model_key", &self.model_key)
+            .field("context_input", &self.context_input)
+            .field("worker_principal_id", &self.worker_principal_id)
+            .field("lease_id", &self.lease_id)
+            .field("lease_version", &self.lease_version)
+            .field("expected_run_version", &self.expected_run_version)
+            .field("mock_mode", &self.mock_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +188,7 @@ struct ProcessRequest {
     lease_id: String,
     expected_run_version: i64,
     mock_mode: MockMode,
+    resume_proposal: Option<ToolProposal>,
 }
 
 impl From<&RunExecutionRequest> for ProcessRequest {
@@ -147,8 +207,19 @@ impl From<&RunExecutionRequest> for ProcessRequest {
             lease_id: value.lease_id.clone(),
             expected_run_version: value.expected_run_version,
             mock_mode: value.mock_mode,
+            resume_proposal: value.resume_proposal.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolProposal {
+    /// Stable model call identity; consequential operations require it.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    pub tool_name: String,
+    pub target: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,6 +232,11 @@ enum ParentFrame {
         session_id: String,
         result: Result<ModelResponse, WireProviderError>,
     },
+    /// Core alone evaluates, persists, and executes a proposed action.
+    ActionResult {
+        session_id: String,
+        outcome: WorkerExecutionOutcome,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,10 +245,85 @@ enum ChildFrame {
         session_id: String,
         request: ModelRequest,
     },
+    /// A worker may propose but never persist or execute a native tool.
+    ToolProposal {
+        session_id: String,
+        proposal: ToolProposal,
+    },
     Outcome {
         session_id: String,
         outcome: WorkerExecutionOutcome,
     },
+}
+
+#[allow(clippy::collapsible_if)]
+fn tool_proposal(response: &ModelResponse) -> Option<ToolProposal> {
+    if let Some(text) = &response.text {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Some(tool_name) = v.get("tool_name").and_then(|s| s.as_str()) {
+                return Some(ToolProposal {
+                    call_id: v.get("call_id").and_then(|v| v.as_str()).map(str::to_owned),
+                    tool_name: tool_name.to_owned(),
+                    target: v
+                        .get("target")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    arguments: v
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                });
+            }
+        }
+    }
+    let value = response.structured.as_ref()?;
+    Some(ToolProposal {
+        call_id: value
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        tool_name: value.get("tool_name")?.as_str()?.to_owned(),
+        target: value.get("target")?.as_str()?.to_owned(),
+        arguments: value.get("arguments")?.clone(),
+    })
+}
+
+fn validate_tool_proposal(proposal: &ToolProposal) -> Result<(), String> {
+    if proposal.tool_name.trim().is_empty() {
+        return Err("tool_name cannot be empty".into());
+    }
+    validate_no_raw_credentials(&proposal.arguments)?;
+    Ok(())
+}
+
+fn validate_no_raw_credentials(value: &serde_json::Value) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                let lower = key.to_ascii_lowercase();
+                if (lower == "secret"
+                    || lower == "api_key"
+                    || lower == "auth_token"
+                    || lower == "password"
+                    || lower == "raw_credential")
+                    && !val.is_null()
+                {
+                    return Err(format!(
+                        "raw credential embedded in tool argument key: {key}"
+                    ));
+                }
+                validate_no_raw_credentials(val)?;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr {
+                validate_no_raw_credentials(val)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -214,7 +365,35 @@ pub async fn execute_run_worker_process(
     request: RunExecutionRequest,
     event_tx: Option<mpsc::Sender<RuntimeStreamEvent>>,
 ) -> Result<WorkerExecutionOutcome, String> {
-    WORKER_PROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+    if let Some(pool) = &request.pool
+        && request.action_handler.is_some()
+    {
+        let lease = nalarvo_persistence::m4::ExecutionLease {
+            id: request.lease_id.clone(),
+            run_id: request.run_id.clone(),
+            worker_principal_id: request.worker_principal_id.clone(),
+            lease_version: request.lease_version,
+            expires_at: Utc::now(),
+        };
+        let step = nalarvo_persistence::m4::resolve_tool_step(
+            pool,
+            &lease,
+            &nalarvo_domain::CompanyId(request.company_id.clone()),
+        )
+        .await
+        .map_err(|e| format!("stale worker fencing: {e}"))?;
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| e.to_string())?;
+        nalarvo_persistence::m4::require_current_lease_tx(&mut tx, &lease)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query("UPDATE execution_steps SET input_metadata=? WHERE id=? AND input_metadata IS NULL")
+            .bind(serde_json::json!({"provider_connection_id":request.provider_connection_id,"model_key":request.model_key}).to_string())
+            .bind(&step).execute(&mut *tx).await.map_err(|e|e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+    }
     let mut child = Command::new(executable)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -222,6 +401,7 @@ pub async fn execute_run_worker_process(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("spawn worker: {e}"))?;
+    WORKER_PROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
     let mut stdin = child.stdin.take().ok_or("worker stdin unavailable")?;
     let mut stdout = child.stdout.take().ok_or("worker stdout unavailable")?;
     let session_id = uuid::Uuid::now_v7().to_string();
@@ -235,58 +415,139 @@ pub async fn execute_run_worker_process(
             },
         )
         .await?;
-        let model_request = match read_frame::<_, ChildFrame>(&mut stdout).await? {
+        let first_frame = read_frame::<_, ChildFrame>(&mut stdout).await?;
+        let next_frame = match first_frame {
             ChildFrame::ProviderCall {
                 session_id: returned,
-                request,
-            } if returned == session_id => request,
-            _ => return Err("worker protocol: expected authenticated provider call".into()),
+                request: model_request,
+            } if returned == session_id && request.resume_proposal.is_none() => {
+                if let Some(pool) = &request.pool {
+                    let valid = nalarvo_persistence::m4::verify_current_lease(
+                        pool,
+                        &request.run_id,
+                        &request.worker_principal_id,
+                        &request.lease_id,
+                        request.lease_version,
+                    )
+                    .await
+                    .map_err(|e| format!("verify lease: {e}"))?;
+
+                    if !valid {
+                        return Err(format!(
+                            "stale worker fencing: lease {} version {} for run {} is no longer valid",
+                            request.lease_id, request.lease_version, request.run_id
+                        ));
+                    }
+                }
+
+                let cancel_rx = request
+                    .cancel_rx
+                    .clone()
+                    .unwrap_or_else(|| watch::channel(false).1);
+                let provider_result = invoke_model(&request, model_request, cancel_rx)
+                    .await
+                    .map_err(wire_error);
+                write_frame(
+                    &mut stdin,
+                    &ParentFrame::ProviderResult {
+                        session_id: session_id.clone(),
+                        result: provider_result,
+                    },
+                )
+                .await?;
+                read_frame::<_, ChildFrame>(&mut stdout).await?
+            }
+            frame @ ChildFrame::ToolProposal { .. } if request.resume_proposal.is_some() => frame,
+            _ => {
+                return Err(
+                    "worker protocol: expected authenticated provider call or continuation".into(),
+                );
+            }
         };
 
-        if let Some(pool) = &request.pool {
-            let valid = nalarvo_persistence::m4::verify_current_lease(
-                pool,
-                &request.run_id,
-                &request.worker_principal_id,
-                &request.lease_id,
-                request.lease_version,
-            )
-            .await
-            .map_err(|e| format!("verify lease: {e}"))?;
-
-            if !valid {
-                return Err(format!(
-                    "stale worker fencing: lease {} version {} for run {} is no longer valid",
-                    request.lease_id, request.lease_version, request.run_id
-                ));
+        match next_frame {
+            ChildFrame::ToolProposal {
+                session_id: returned,
+                proposal,
+            } if returned == session_id => {
+                validate_tool_proposal(&proposal)?;
+                if request
+                    .resume_proposal
+                    .as_ref()
+                    .is_some_and(|saved| saved != &proposal)
+                {
+                    return Err("worker continuation differs from durable checkpoint".into());
+                }
+                let handler = request
+                    .action_handler
+                    .as_ref()
+                    .ok_or_else(|| "Core action proposal service unavailable".to_string())?;
+                let trusted_context = crate::core_dispatch::TrustedRunContext {
+                    run_id: request.run_id.clone(),
+                    company_id: request.company_id.clone(),
+                    project_id: request.project_id.clone(),
+                    work_item_id: request.work_item_id.clone(),
+                    agent_id: request.agent_id.clone(),
+                    lease_id: request.lease_id.clone(),
+                    lease_version: request.lease_version,
+                    worker_principal_id: request.worker_principal_id.clone(),
+                    live_lease_version: None,
+                };
+                let mut cancel_rx = request.cancel_rx.clone();
+                if cancel_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+                    return Err("worker action cancelled before dispatch".into());
+                }
+                let cancelled = async {
+                    if let Some(rx) = cancel_rx.as_mut() {
+                        loop {
+                            if *rx.borrow() {
+                                return;
+                            }
+                            if rx.changed().await.is_err() {
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let outcome = tokio::select! {
+                    biased;
+                    _=cancelled=>return Err("worker action cancelled".into()),
+                    result=handler(trusted_context, proposal)=>result?,
+                };
+                write_frame(
+                    &mut stdin,
+                    &ParentFrame::ActionResult {
+                        session_id: session_id.clone(),
+                        outcome: outcome.clone(),
+                    },
+                )
+                .await?;
+                match read_frame::<_, ChildFrame>(&mut stdout).await? {
+                    ChildFrame::Outcome {
+                        session_id: returned,
+                        outcome: _child_outcome,
+                    } if returned == session_id => {
+                        stdin
+                            .shutdown()
+                            .await
+                            .map_err(|e| format!("close worker stdin: {e}"))?;
+                        Ok(outcome)
+                    }
+                    _ => Err("worker protocol: expected authenticated outcome".into()),
+                }
             }
-        }
-
-        let cancel_rx = request
-            .cancel_rx
-            .clone()
-            .unwrap_or_else(|| watch::channel(false).1);
-        let provider_result = invoke_model(&request, model_request, cancel_rx)
-            .await
-            .map_err(wire_error);
-        write_frame(
-            &mut stdin,
-            &ParentFrame::ProviderResult {
-                session_id: session_id.clone(),
-                result: provider_result,
-            },
-        )
-        .await?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|e| format!("close worker stdin: {e}"))?;
-
-        match read_frame::<_, ChildFrame>(&mut stdout).await? {
             ChildFrame::Outcome {
                 session_id: returned,
                 outcome,
-            } if returned == session_id => Ok(outcome),
+            } if returned == session_id => {
+                stdin
+                    .shutdown()
+                    .await
+                    .map_err(|e| format!("close worker stdin: {e}"))?;
+                Ok(outcome)
+            }
             _ => Err("worker protocol: expected authenticated outcome".into()),
         }
     };
@@ -308,6 +569,7 @@ pub async fn execute_run_worker_process(
         .wait()
         .await
         .map_err(|e| format!("wait worker: {e}"))?;
+    WORKER_PROCESS_REAP_COUNT.fetch_add(1, Ordering::SeqCst);
     if !status.success() {
         return Err(format!("worker exited with {status}"));
     }
@@ -327,6 +589,31 @@ pub async fn run_worker_stdio() -> Result<(), String> {
         _ => return Err("worker protocol: expected start".into()),
     };
     let started_at = Utc::now();
+    if let Some(proposal) = request.resume_proposal {
+        write_frame(
+            &mut stdout,
+            &ChildFrame::ToolProposal {
+                session_id: session_id.clone(),
+                proposal,
+            },
+        )
+        .await?;
+        let outcome = match read_frame::<_, ParentFrame>(&mut stdin).await? {
+            ParentFrame::ActionResult {
+                session_id: returned,
+                outcome,
+            } if returned == session_id => outcome,
+            _ => return Err("worker protocol: expected authenticated continuation result".into()),
+        };
+        return write_frame(
+            &mut stdout,
+            &ChildFrame::Outcome {
+                session_id,
+                outcome,
+            },
+        )
+        .await;
+    }
     let model_request = match prepare_model_request(
         &request.run_id,
         &request.model_key,
@@ -360,6 +647,34 @@ pub async fn run_worker_stdio() -> Result<(), String> {
         } if returned == session_id => result,
         _ => return Err("worker protocol: expected authenticated provider result".into()),
     };
+    #[allow(clippy::collapsible_if)]
+    if let Ok(response) = &result {
+        if let Some(proposal) = tool_proposal(response) {
+            write_frame(
+                &mut stdout,
+                &ChildFrame::ToolProposal {
+                    session_id: session_id.clone(),
+                    proposal,
+                },
+            )
+            .await?;
+            let outcome = match read_frame::<_, ParentFrame>(&mut stdin).await? {
+                ParentFrame::ActionResult {
+                    session_id: returned,
+                    outcome,
+                } if returned == session_id => outcome,
+                _ => return Err("worker protocol: expected authenticated action result".into()),
+            };
+            return write_frame(
+                &mut stdout,
+                &ChildFrame::Outcome {
+                    session_id,
+                    outcome,
+                },
+            )
+            .await;
+        }
+    }
     let outcome = finish_response(request.run_id, started_at, result);
     write_frame(
         &mut stdout,
@@ -408,19 +723,30 @@ async fn invoke_model(
     model_request: ModelRequest,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<ModelResponse, ProviderError> {
-    record_provider_invocation();
-    if let (Some(base_url), Some(auth_token)) = (&request.base_url, &request.auth_token)
-        && request.mock_mode == MockMode::SUCCESS_TEXT
-    {
-        return OpenAiCompatibleProvider::new(base_url.clone())?
-            .complete(
-                model_request,
-                auth_token,
-                Duration::from_secs(30),
-                cancel_rx,
-            )
-            .await;
+    if let Some(handler) = &request.model_handler {
+        let ctx = crate::core_dispatch::TrustedRunContext {
+            run_id: request.run_id.clone(),
+            company_id: request.company_id.clone(),
+            project_id: request.project_id.clone(),
+            work_item_id: request.work_item_id.clone(),
+            agent_id: request.agent_id.clone(),
+            lease_id: request.lease_id.clone(),
+            lease_version: request.lease_version,
+            worker_principal_id: request.worker_principal_id.clone(),
+            live_lease_version: None,
+        };
+        return handler(ctx, model_request, cancel_rx).await;
     }
+    if request.base_url.is_some() || request.auth_token.is_some() {
+        return Err(ProviderError {
+            kind: ProviderErrorKind::Authentication,
+            message: "provider invocation requires trusted Core model handler".into(),
+            request_id: None,
+            status: None,
+        });
+    }
+    // Deterministic credential-free compatibility for M4 process fixtures only.
+    record_provider_invocation();
     MockProvider
         .execute(
             model_request,
@@ -435,6 +761,23 @@ fn wire_error(error: ProviderError) -> WireProviderError {
     WireProviderError {
         class: provider_failure_class(error.kind).into(),
         detail: error.to_string(),
+    }
+}
+
+#[allow(dead_code)]
+fn waiting_approval_outcome(run_id: String) -> WorkerExecutionOutcome {
+    WorkerExecutionOutcome {
+        run_id,
+        status: RunStatus::WaitingApproval,
+        result_summary: "Approval required".into(),
+        output_text: None,
+        failure_class: None,
+        failure_detail: None,
+        input_tokens: None,
+        output_tokens: None,
+        latency_ms: None,
+        context_step_status: ExecutionStepStatus::Succeeded,
+        model_step_status: ExecutionStepStatus::Succeeded,
     }
 }
 
@@ -584,4 +927,101 @@ pub async fn invoke_openai_compatible(
     OpenAiCompatibleProvider::new(endpoint)?
         .complete(request, auth, Duration::from_secs(30), cancel)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resume_frame_contains_only_safe_operation_not_authentication() {
+        let mut request = RunExecutionRequest {
+            run_id: "run".into(),
+            company_id: "company".into(),
+            project_id: "project".into(),
+            work_item_id: "work".into(),
+            agent_id: "agent".into(),
+            model_profile_version_id: None,
+            provider_connection_id: "provider".into(),
+            base_url: None,
+            auth_token: Some("SYNTHETIC_RESUME_AUTH_CANARY".into()),
+            model_key: "model".into(),
+            context_input: ContextInput::minimal("company", "project", "work"),
+            worker_principal_id: "worker".into(),
+            lease_id: "lease".into(),
+            lease_version: 2,
+            pool: None,
+            expected_run_version: 3,
+            mock_mode: MockMode::SUCCESS_TEXT,
+            cancel_rx: None,
+            action_handler: None,
+            model_handler: None,
+            resume_proposal: Some(ToolProposal {
+                call_id: Some("write-1".into()),
+                tool_name: "filesystem.write".into(),
+                target: "note.txt".into(),
+                arguments: serde_json::json!({"path":"note.txt","content":"checked"}),
+            }),
+        };
+        let frame = serde_json::to_string(&ProcessRequest::from(&request)).unwrap();
+        assert!(frame.contains("write-1"));
+        assert!(!frame.contains("SYNTHETIC_RESUME_AUTH_CANARY"));
+        assert!(!frame.contains("auth_token"));
+        request.base_url = Some("http://127.0.0.1:1/".into());
+        let error = invoke_model(
+            &request,
+            ModelRequest {
+                model: "model".into(),
+                messages: vec![nalarvo_model_gateway::ModelMessage::user("check")],
+                temperature: None,
+                max_tokens: None,
+                stream: false,
+            },
+            watch::channel(false).1,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Authentication);
+    }
+
+    #[test]
+    fn debug_redacts_auth_token_canary() {
+        let request = RunExecutionRequest {
+            run_id: "run".into(),
+            company_id: "company".into(),
+            project_id: "project".into(),
+            work_item_id: "work".into(),
+            agent_id: "agent".into(),
+            model_profile_version_id: None,
+            provider_connection_id: "provider".into(),
+            base_url: None,
+            auth_token: Some("SYNTHETIC_TOKEN_CANARY".into()),
+            model_key: "model".into(),
+            context_input: crate::context::ContextInput::minimal("company", "project", "work"),
+            worker_principal_id: "worker".into(),
+            lease_id: "lease".into(),
+            lease_version: 1,
+            pool: None,
+            expected_run_version: 1,
+            mock_mode: MockMode::SUCCESS_TEXT,
+            cancel_rx: None,
+            action_handler: None,
+            model_handler: None,
+            resume_proposal: None,
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("SYNTHETIC_TOKEN_CANARY"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn raw_credential_arguments_are_rejected() {
+        let proposal = ToolProposal {
+            call_id: None,
+            tool_name: "custom_tool".into(),
+            target: "endpoint".into(),
+            arguments: serde_json::json!({ "api_key": "raw_secret" }),
+        };
+        assert!(validate_tool_proposal(&proposal).is_err());
+    }
 }

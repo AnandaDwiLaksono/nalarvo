@@ -100,6 +100,108 @@ async fn post<T: DeserializeOwned, B: serde::Serialize>(
     .await
 }
 
+pub async fn list_approvals(
+    base_url: &str,
+    bearer: &str,
+    company_id: &str,
+) -> Result<Vec<nalarvo_contracts::ApprovalInboxItem>, ClientError> {
+    get(
+        base_url,
+        bearer,
+        &format!("/api/v1/companies/{company_id}/approvals"),
+    )
+    .await
+}
+
+pub async fn list_actions(
+    base_url: &str,
+    bearer: &str,
+    company_id: &str,
+) -> Result<Vec<nalarvo_contracts::ActionSummaryDto>, ClientError> {
+    get(
+        base_url,
+        bearer,
+        &format!("/api/v1/companies/{company_id}/actions"),
+    )
+    .await
+}
+
+pub async fn get_action(
+    base_url: &str,
+    bearer: &str,
+    company_id: &str,
+    action_id: &str,
+) -> Result<nalarvo_contracts::ActionSummaryDto, ClientError> {
+    get(
+        base_url,
+        bearer,
+        &format!("/api/v1/companies/{company_id}/actions/{action_id}"),
+    )
+    .await
+}
+
+pub async fn list_permission_definitions(
+    base_url: &str,
+    bearer: &str,
+) -> Result<Vec<nalarvo_contracts::PermissionDefinitionDto>, ClientError> {
+    get(base_url, bearer, "/api/v1/permission-definitions").await
+}
+
+pub async fn list_permission_grants(
+    base_url: &str,
+    bearer: &str,
+    company_id: &str,
+) -> Result<Vec<nalarvo_contracts::PermissionGrantDto>, ClientError> {
+    get(
+        base_url,
+        bearer,
+        &format!("/api/v1/companies/{company_id}/permission-grants"),
+    )
+    .await
+}
+
+pub async fn list_policies(
+    base_url: &str,
+    bearer: &str,
+    company_id: &str,
+) -> Result<Vec<nalarvo_contracts::PolicyDto>, ClientError> {
+    get(
+        base_url,
+        bearer,
+        &format!("/api/v1/companies/{company_id}/policies"),
+    )
+    .await
+}
+
+pub async fn list_budgets(
+    base_url: &str,
+    bearer: &str,
+    company_id: &str,
+) -> Result<Vec<nalarvo_contracts::BudgetDto>, ClientError> {
+    get(
+        base_url,
+        bearer,
+        &format!("/api/v1/companies/{company_id}/budgets"),
+    )
+    .await
+}
+
+pub async fn decide_approval(
+    base_url: &str,
+    bearer: &str,
+    company_id: &str,
+    approval_id: &str,
+    req: &nalarvo_contracts::DecideApprovalRequest,
+) -> Result<nalarvo_contracts::DecideApprovalResponse, ClientError> {
+    post(
+        base_url,
+        bearer,
+        &format!("/api/v1/companies/{company_id}/approvals/{approval_id}/decide"),
+        req,
+    )
+    .await
+}
+
 pub async fn health(base_url: &str, bearer: &str) -> Result<HealthResponse, ClientError> {
     let response = reqwest::Client::new()
         .get(format!("{base_url}/api/v1/health"))

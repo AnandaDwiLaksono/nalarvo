@@ -24,7 +24,110 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ApprovalCommands {
+    /// List pending approvals
+    List {
+        #[arg(long)]
+        company_id: String,
+    },
+    /// Decide on an approval request
+    Decide {
+        #[arg(long)]
+        company_id: String,
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long)]
+        approver_id: String,
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long)]
+        approve: bool,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ActionCommands {
+    /// List actions
+    List {
+        #[arg(long)]
+        company_id: String,
+    },
+    /// Show action detail
+    Show {
+        #[arg(long)]
+        company_id: String,
+        #[arg(long)]
+        action_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PermissionCommands {
+    /// List permission definitions
+    List,
+}
+
+#[derive(Subcommand)]
+enum GrantCommands {
+    /// List permission grants
+    List {
+        #[arg(long)]
+        company_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommands {
+    /// List policies
+    List {
+        #[arg(long)]
+        company_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BudgetCommands {
+    /// Show budgets
+    Show {
+        #[arg(long)]
+        company_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
+    /// Action commands
+    Action {
+        #[command(subcommand)]
+        command: ActionCommands,
+    },
+    /// Approval actions
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommands,
+    },
+    /// Permission definition commands
+    Permission {
+        #[command(subcommand)]
+        command: PermissionCommands,
+    },
+    /// Permission grant commands
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommands,
+    },
+    /// Policy commands
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
+    /// Budget commands
+    Budget {
+        #[command(subcommand)]
+        command: BudgetCommands,
+    },
     /// Check core daemon health
     Health,
     /// Manage companies
@@ -251,6 +354,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Action { command } => match command {
+            ActionCommands::List { company_id } => {
+                let res =
+                    nalarvo_client::list_actions(&cli.daemon_url, &cli.token, &company_id).await?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+            ActionCommands::Show {
+                company_id,
+                action_id,
+            } => {
+                let res = nalarvo_client::get_action(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company_id,
+                    &action_id,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+        },
+        Commands::Permission { command } => match command {
+            PermissionCommands::List => {
+                let res = nalarvo_client::list_permission_definitions(&cli.daemon_url, &cli.token)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+        },
+        Commands::Grant { command } => match command {
+            GrantCommands::List { company_id } => {
+                let res = nalarvo_client::list_permission_grants(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company_id,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+        },
+        Commands::Policy { command } => match command {
+            PolicyCommands::List { company_id } => {
+                let res =
+                    nalarvo_client::list_policies(&cli.daemon_url, &cli.token, &company_id).await?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+        },
+        Commands::Budget { command } => match command {
+            BudgetCommands::Show { company_id } => {
+                let res =
+                    nalarvo_client::list_budgets(&cli.daemon_url, &cli.token, &company_id).await?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+        },
+        Commands::Approval { command } => match command {
+            ApprovalCommands::List { company_id } => {
+                let res = nalarvo_client::list_approvals(&cli.daemon_url, &cli.token, &company_id)
+                    .await?;
+                for item in res {
+                    println!(
+                        "ID: {} | Action: {} | Status: {}",
+                        item.id, item.action_id, item.status
+                    );
+                }
+            }
+            ApprovalCommands::Decide {
+                company_id,
+                approval_id,
+                approver_id,
+                fingerprint,
+                approve,
+                reason,
+            } => {
+                let req = nalarvo_contracts::DecideApprovalRequest {
+                    decided_by_type: "USER".into(),
+                    decided_by_id: approver_id,
+                    fingerprint,
+                    approved: approve,
+                    reason,
+                };
+                let res = nalarvo_client::decide_approval(
+                    &cli.daemon_url,
+                    &cli.token,
+                    &company_id,
+                    &approval_id,
+                    &req,
+                )
+                .await?;
+                println!(
+                    "Approval {} decided: {}",
+                    res.approval_request_id, res.decision
+                );
+            }
+        },
         Commands::Health => {
             let res = nalarvo_client::health(&cli.daemon_url, &cli.token).await?;
             println!("service: {}, status: {}", res.service, res.status);

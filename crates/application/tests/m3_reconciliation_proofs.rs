@@ -336,13 +336,29 @@ async fn test_proof_department_immutability_and_work_item_not_run() {
         .await;
     assert!(dept_mod.is_err());
 
-    // Prove M4/M5 boundary: verify M5 actions table does NOT exist in M4
-    let actions_check =
-        sqlx::query("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='actions'")
-            .fetch_one(pool)
-            .await
-            .unwrap();
-    let count: i64 = sqlx::Row::get(&actions_check, 0);
+    // Preserve the M4 boundary proof against M4 migrations, not the current M5 schema.
+    let legacy = tempdir().unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".sql") && name.as_str() < "0012" {
+            std::fs::copy(entry.path(), legacy.path().join(name)).unwrap();
+        }
+    }
+    let m4 = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::migrate::Migrator::new(legacy.path())
+        .await
+        .unwrap()
+        .run(&m4)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='actions'",
+    )
+    .fetch_one(&m4)
+    .await
+    .unwrap();
     assert_eq!(count, 0, "M5 actions table must NOT exist in M4!");
 }
 

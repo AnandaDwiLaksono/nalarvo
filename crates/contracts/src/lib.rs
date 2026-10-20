@@ -580,6 +580,99 @@ pub struct WorkListResponse {
     pub work_items: Vec<WorkItemDto>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalInboxItem {
+    pub id: String,
+    pub fingerprint: String,
+    pub action_id: String,
+    pub company_id: String,
+    pub requested_by_id: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub requested_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideApprovalRequest {
+    pub decided_by_type: String,
+    pub decided_by_id: String,
+    pub fingerprint: String,
+    pub approved: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecideApprovalResponse {
+    pub id: String,
+    pub approval_request_id: String,
+    pub decision: String,
+    pub decided_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionSummaryDto {
+    pub id: String,
+    pub company_id: String,
+    pub run_id: Option<String>,
+    pub action_type: String,
+    pub target: String,
+    pub authorization: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionDefinitionDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub resource: String,
+    pub operation: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionGrantDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub company_id: String,
+    pub permission_definition_id: String,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub effect: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub company_id: Option<String>,
+    pub name: String,
+    pub status: String,
+    pub current_version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub company_id: String,
+    pub project_id: Option<String>,
+    pub name: String,
+    pub currency: String,
+    pub status: String,
+    pub total_limit: f64,
+    pub reserved_amount: f64,
+    pub spent_amount: f64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkItemRequest {
     pub objective_id: Option<String>,
