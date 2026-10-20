@@ -9,7 +9,7 @@ use serde_json::json;
 use sqlx::SqlitePool;
 
 async fn fixture() -> (tempfile::TempDir, SqlitePool, Run, String) {
-    let dir = tempfile::tempdir_in(std::env::var("TMPDIR").unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("crash.db");
     let pool = create_pool(&format!("sqlite://{}", path.display()))
         .await

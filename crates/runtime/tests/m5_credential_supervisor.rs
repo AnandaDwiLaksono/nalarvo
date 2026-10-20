@@ -143,8 +143,7 @@ async fn fixture(pool: &SqlitePool, endpoint: &str, authorized: bool) -> Run {
 async fn child_supervisor_core_model_broker_local_provider() {
     assert!(std::path::Path::new(env!("CARGO_BIN_EXE_nalarvo-worker")).is_file());
     for authorized in [false, true] {
-        let root =
-            tempfile::tempdir_in(std::env::var("TMPDIR").expect("Hermes scratch TMPDIR")).unwrap();
+        let root = tempfile::tempdir().unwrap();
         let db = root.path().join("runtime.db");
         let pool = create_pool(&format!("sqlite://{}", db.display()))
             .await

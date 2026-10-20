@@ -27,8 +27,7 @@ use std::{
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn setup() -> (tempfile::TempDir, SqlitePool, Run) {
-    let root =
-        tempfile::tempdir_in(std::env::var("TMPDIR").expect("Hermes scratch TMPDIR")).unwrap();
+    let root = tempfile::tempdir().unwrap();
     let pool = create_pool(&format!(
         "sqlite://{}",
         root.path().join("approval.db").display()
