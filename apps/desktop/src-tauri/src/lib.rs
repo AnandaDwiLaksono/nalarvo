@@ -1054,6 +1054,70 @@ async fn core_list_usage_records(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn core_list_artifacts(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+) -> Result<Vec<nalarvo_contracts::m6::Artifact>, String> {
+    nalarvo_client::m6::list_artifacts(&daemon_url, &token, &company_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn core_artifact_versions(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    artifact_id: String,
+    after_version: Option<i64>,
+) -> Result<Vec<nalarvo_contracts::m6::ArtifactVersion>, String> {
+    nalarvo_client::m6::artifact_versions_page(
+        &daemon_url,
+        &token,
+        &company_id,
+        &artifact_id,
+        &nalarvo_contracts::m6::ArtifactVersionQuery {
+            after_version: after_version.unwrap_or(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn core_list_knowledge(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+) -> Result<Vec<nalarvo_contracts::m6::InformationRecord>, String> {
+    nalarvo_client::m6::list_knowledge(&daemon_url, &token, &company_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn core_search_information(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    payload: nalarvo_contracts::m6::SearchRequest,
+) -> Result<Vec<nalarvo_contracts::m6::InformationRecord>, String> {
+    nalarvo_client::m6::search_information(&daemon_url, &token, &company_id, &payload)
+        .await
+        .map_err(|e| e.to_string())
+}
+#[tauri::command]
+async fn core_context_snapshots(
+    token: tauri::State<'_, String>,
+    daemon_url: tauri::State<'_, String>,
+    company_id: String,
+    run_id: String,
+) -> Result<Vec<nalarvo_contracts::m6::ContextSnapshot>, String> {
+    nalarvo_client::m6::context_snapshots(&daemon_url, &token, &company_id, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn start_daemon() -> Result<(String, Child), String> {
     let daemon_name = if cfg!(windows) {
         "nalarvo-daemon.exe"
@@ -1168,7 +1232,12 @@ pub fn run() {
             core_list_actions,
             core_get_action,
             core_list_approvals,
-            core_decide_approval
+            core_decide_approval,
+            core_list_artifacts,
+            core_artifact_versions,
+            core_list_knowledge,
+            core_search_information,
+            core_context_snapshots
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nalarvo desktop");

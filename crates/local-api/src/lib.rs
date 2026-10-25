@@ -45,6 +45,7 @@ use tokio_stream::StreamExt;
 
 pub mod m4;
 pub mod m5;
+pub mod m6;
 use tokio_stream::wrappers::BroadcastStream;
 
 #[derive(Clone)]
@@ -228,6 +229,7 @@ pub fn router_with_app(token: impl Into<Arc<str>>, app_ctx: Option<ApplicationCo
         )
         .route("/api/v1/events", get(events_sse))
         .merge(m4::routes())
+        .merge(m6::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,

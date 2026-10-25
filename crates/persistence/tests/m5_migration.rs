@@ -100,7 +100,7 @@ async fn historical_0012_upgrades_without_rewriting_checksums_and_unknown_sql_is
                     .skip(before.len())
                     .map(|r| r.0)
                     .collect::<Vec<_>>(),
-                [13, 14]
+                [13, 14, 15, 16, 17]
             );
             run_migrations(&pool).await.unwrap();
             let project: Option<String> =
@@ -235,7 +235,13 @@ async fn project_scope_upgrade_preserves_existing_budget_and_accounting() {
             .await
             .unwrap();
     assert_eq!(&after[..before.len()], before);
-    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(
+        after[before.len()..]
+            .iter()
+            .map(|(v, _)| *v)
+            .collect::<Vec<_>>(),
+        vec![14, 15, 16, 17]
+    );
     let budget: (Option<String>, f64, f64, f64) = sqlx::query_as(
         "SELECT project_id,total_limit,reserved_amount,spent_amount FROM budgets WHERE id='b'",
     )
@@ -346,8 +352,14 @@ async fn fresh_and_m4_upgrade_preserve_order_checksums_and_data() {
             .map(|row| (row.get(0), row.get(1)))
             .collect();
     assert_eq!(&applied[..prior.len()], prior);
-    assert_eq!(applied.len(), prior.len() + 3);
-    assert_eq!(applied.last().unwrap().0, 14);
+    assert_eq!(
+        applied[prior.len()..]
+            .iter()
+            .map(|(v, _)| *v)
+            .collect::<Vec<_>>(),
+        vec![12, 13, 14, 15, 16, 17]
+    );
+    assert_eq!(applied.last().unwrap().0, 17);
     let name: String = sqlx::query_scalar("SELECT email FROM users WHERE id='u'")
         .fetch_one(&pool)
         .await

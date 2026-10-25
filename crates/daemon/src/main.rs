@@ -23,6 +23,9 @@ struct Args {
         default_value = "sqlite://data.sqlite?mode=rwc"
     )]
     db_url: String,
+    /// Private Core store, never a Project working root.
+    #[arg(long, env = "NALARVO_CONTENT_DIR")]
+    content_dir: Option<std::path::PathBuf>,
     /// Trusted operator JSON: [{"executable":"C:\\...\\tool.exe","args":["--version"],"timeout_ms":5000}].
     #[arg(long, env = "NALARVO_SHELL_ALLOWLIST", default_value = "[]")]
     shell_allowlist: String,
@@ -47,6 +50,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_ctx =
         ApplicationContext::init_with_secret_store(&args.db_url, Arc::new(WindowsCredentialStore))
             .await?;
+    let content_dir = args
+        .content_dir
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(|p| std::path::PathBuf::from(p).join("Nalarvo").join("content"))
+        })
+        .ok_or("Set NALARVO_CONTENT_DIR to an absolute private directory")?;
+    let app_ctx = app_ctx.with_content_store(Arc::new(
+        nalarvo_application::content_store::LocalContentStore::open(&content_dir)?,
+    ));
+    app_ctx.validate_content_roots().await?;
 
     // Start background outbox dispatcher
     let dispatcher = start_outbox_dispatcher(app_ctx.clone(), 500, "daemon-dispatcher".into());

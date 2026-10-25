@@ -22,6 +22,7 @@ use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
 pub mod m4;
+pub mod m6;
 pub use m4::*;
 
 #[derive(Debug, thiserror::Error)]

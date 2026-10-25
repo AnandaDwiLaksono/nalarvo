@@ -175,7 +175,13 @@ async fn child_supervisor_core_model_broker_local_provider() {
         let run = fixture(&pool, &endpoint, authorized).await;
         let gets = Arc::new(AtomicUsize::new(0));
         let app = ApplicationContext::new(pool.clone())
-            .with_secret_store(Arc::new(CountingStore(gets.clone())));
+            .with_secret_store(Arc::new(CountingStore(gets.clone())))
+            .with_content_store(Arc::new(
+                nalarvo_application::content_store::LocalContentStore::open(
+                    &root.path().join("content"),
+                )
+                .unwrap(),
+            ));
         let supervisor = RuntimeSupervisor::new(
             pool.clone(),
             SupervisorConfig {

@@ -28,7 +28,7 @@ fn denied() -> ProviderError {
 }
 
 // Provider bodies and transport messages are untrusted: persist only known-safe diagnostics.
-fn safe_provider_error(error: ProviderError, token: &str) -> ProviderError {
+fn safe_provider_error(error: ProviderError) -> ProviderError {
     ProviderError {
         kind: error.kind,
         message: match error.status {
@@ -40,7 +40,8 @@ fn safe_provider_error(error: ProviderError, token: &str) -> ProviderError {
                 _ => "provider transport failure".into(),
             },
         },
-        request_id: error.request_id.filter(|id| !id.contains(token)),
+        // Provider correlation metadata is untrusted; internal invocation/run IDs suffice.
+        request_id: None,
         status: error.status,
     }
 }
@@ -84,7 +85,7 @@ pub fn handler(app: ApplicationContext) -> ModelRequestHandler {
 async fn execute(
     app: &ApplicationContext,
     ctx: TrustedRunContext,
-    request: ModelRequest,
+    mut request: ModelRequest,
     cancel: watch::Receiver<bool>,
 ) -> Result<ModelResponse, ProviderError> {
     if *cancel.borrow() || request.model.trim().is_empty() || request.messages.is_empty() {
@@ -297,13 +298,53 @@ async fn execute(
         return Err(denied());
     }
     let token = token.ok_or_else(denied)?;
-    // ponytail: fail closed on reflected bearer; structured redaction if more secret forms are supported.
+    if !nalarvo_application::m6_context::context_value_allowed(
+        &serde_json::Value::String(request.model.clone()),
+        token,
+    ) {
+        nalarvo_persistence::m5::release_model_reservation(&app.pool, &invocation_id)
+            .await
+            .map_err(|_| denied())?;
+        return Err(denied());
+    }
+    let prepared = app.prepare_model_context(&ctx.company_id, &ctx.run_id, &invocation_id,
+        serde_json::json!({"profile_id":profile_id,"version":version,"model_id":binding.get::<String,_>("model_id"),"provider_id":binding.get::<String,_>("provider_connection_id")}), token).await;
+    let (messages, snapshot_id) = match prepared {
+        Ok(context) => context,
+        Err(_) => {
+            nalarvo_persistence::m5::release_model_reservation(&app.pool, &invocation_id)
+                .await
+                .map_err(|_| denied())?;
+            return Err(denied());
+        }
+    };
+    request.messages = serde_json::from_value(messages).map_err(|_| denied())?;
+    request.max_tokens = Some(1024);
+    request.temperature = Some(0.0);
+    request.stream = false;
+    if *cancel.borrow()
+        || current_lease(app, &ctx).await.is_err()
+        || !nalarvo_application::m6_context::context_value_allowed(
+            &serde_json::json!({"model":request.model,"messages":request.messages}),
+            token,
+        )
+    {
+        nalarvo_persistence::m5::release_model_reservation(&app.pool, &invocation_id)
+            .await
+            .map_err(|_| denied())?;
+        return Err(denied());
+    }
+    // Selected credential stays in the trusted adapter Authorization header only.
     // Never forward provider errors verbatim: transport diagnostics can contain credentials.
     let started_at = Utc::now();
     let result = provider
         .complete(request, token, Duration::from_secs(30), cancel.clone())
         .await
-        .map_err(|error| safe_provider_error(error, token));
+        .map_err(safe_provider_error)
+        .map(|mut response| {
+            response.request_id = None;
+            response
+        });
     if *cancel.borrow() && result.is_ok() {
         return Err(denied());
     }
@@ -333,7 +374,7 @@ async fn execute(
             model_profile_version_id: Some(format!("{profile_id}:{version}")),
             invocation_index: index,
             status: "FAILED".into(),
-            request_metadata: None,
+            request_metadata: Some(serde_json::json!({"context_snapshot_id":snapshot_id})),
             response_metadata: None,
             input_tokens: None,
             output_tokens: None,
@@ -355,26 +396,10 @@ async fn execute(
         .map_err(|_| denied())?;
     }
     let response = result?;
-    if response
-        .request_id
-        .as_deref()
-        .is_some_and(|id| id.contains(token))
-    {
-        return Err(denied());
-    }
-    if response
-        .text
-        .as_deref()
-        .is_some_and(|text| text.contains(token))
-        || response
-            .structured
-            .as_ref()
-            .is_some_and(|value| value.to_string().contains(token))
-        || response
-            .request_id
-            .as_deref()
-            .is_some_and(|id| id.contains(token))
-    {
+    if !nalarvo_application::m6_context::context_value_allowed(
+        &serde_json::json!({"text":response.text,"structured":response.structured,"request_id":response.request_id}),
+        token,
+    ) {
         return Err(denied());
     }
     // Persist only a real provider response; the worker never supplies canonical IDs or usage.
@@ -404,7 +429,7 @@ async fn execute(
         model_profile_version_id: Some(format!("{profile_id}:{version}")),
         invocation_index: index,
         status: "SUCCEEDED".into(),
-        request_metadata: None,
+        request_metadata: Some(serde_json::json!({"context_snapshot_id":snapshot_id})),
         response_metadata: None,
         input_tokens: response
             .usage

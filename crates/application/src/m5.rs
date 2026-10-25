@@ -872,6 +872,7 @@ impl ApplicationContext {
 
     /// Shared live authority and canonical material validation inside the caller's transaction.
     async fn validate_runtime_action_connection(
+        &self,
         connection: &mut sqlx::SqliteConnection,
         cmd: &ProposeActionCommand,
         action_id: &str,
@@ -906,6 +907,7 @@ impl ApplicationContext {
             .ok_or_else(|| ApplicationError::Validation("Invalid current Project root".into()))?;
         #[cfg(not(windows))]
         let _ = check_filesystem_material;
+        self.validate_project_content_boundary(&canonical)?;
         #[cfg(windows)]
         if check_filesystem_material {
             let binding = if cmd.action_type == "filesystem.write"
@@ -1017,10 +1019,9 @@ impl ApplicationContext {
                 "Run is not awaiting approved resume".into(),
             ));
         }
-        let row = Self::validate_runtime_action_connection(
-            &mut tx, cmd, action_id, lease, &run_state, true,
-        )
-        .await?;
+        let row = self
+            .validate_runtime_action_connection(&mut tx, cmd, action_id, lease, &run_state, true)
+            .await?;
         if row.get::<String, _>("status") != "PENDING"
             || row.get::<String, _>("authorization") != "APPROVED"
         {
@@ -1088,10 +1089,9 @@ impl ApplicationContext {
     ) -> Result<bool, ApplicationError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         nalarvo_persistence::m4::require_current_lease_tx(&mut tx, lease).await?;
-        let row = Self::validate_runtime_action_connection(
-            &mut tx, cmd, action_id, lease, "RUNNING", false,
-        )
-        .await?;
+        let row = self
+            .validate_runtime_action_connection(&mut tx, cmd, action_id, lease, "RUNNING", false)
+            .await?;
         if row.get::<String, _>("status") != "PENDING" {
             tx.commit().await?;
             return Ok(false);
@@ -1165,7 +1165,7 @@ impl ApplicationContext {
         }
         // A competing Action can consume the last budget slot and publish while this
         // Action waits. Preserve durable budget rejection before target-material check.
-        Self::validate_runtime_action_connection(&mut tx, cmd, action_id, lease, "RUNNING", true)
+        self.validate_runtime_action_connection(&mut tx, cmd, action_id, lease, "RUNNING", true)
             .await?;
         for b in budgets {
             let budget: String = b.get("id");
@@ -1222,11 +1222,10 @@ impl ApplicationContext {
         nalarvo_persistence::m4::require_current_lease_tx(&mut tx, lease)
             .await
             .map_err(|e| e.to_string())?;
-        let row = Self::validate_runtime_action_connection(
-            &mut tx, cmd, action_id, lease, "RUNNING", true,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let row = self
+            .validate_runtime_action_connection(&mut tx, cmd, action_id, lease, "RUNNING", true)
+            .await
+            .map_err(|e| e.to_string())?;
         if row.get::<String, _>("status") != "STARTED" || cmd.action_type != "filesystem.write" {
             return Err("Runtime write no longer authorized".into());
         }
@@ -1258,11 +1257,10 @@ impl ApplicationContext {
         nalarvo_persistence::m4::require_current_lease_tx(&mut tx, lease)
             .await
             .map_err(|e| e.to_string())?;
-        let row = Self::validate_runtime_action_connection(
-            &mut tx, cmd, action_id, lease, "RUNNING", true,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let row = self
+            .validate_runtime_action_connection(&mut tx, cmd, action_id, lease, "RUNNING", true)
+            .await
+            .map_err(|e| e.to_string())?;
         if cmd.action_type != "shell.execute" || row.get::<String, _>("status") != "STARTED" {
             return Err("Runtime shell no longer authorized".into());
         }

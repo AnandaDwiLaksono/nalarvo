@@ -2380,6 +2380,7 @@ dependencies = [
 name = "nalarvo-contracts"
 version = "0.1.0"
 dependencies = [
+ "nalarvo-domain",
  "serde",
  "serde_json",
 ]

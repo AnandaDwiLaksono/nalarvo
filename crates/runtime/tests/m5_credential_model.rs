@@ -116,7 +116,11 @@ async fn real_provider_requires_current_lease_grant_permission_and_eligible_mode
     }
     let gets = Arc::new(AtomicUsize::new(0));
     let app = ApplicationContext::new(pool.clone())
-        .with_secret_store(Arc::new(CountingStore(gets.clone())));
+        .with_secret_store(Arc::new(CountingStore(gets.clone())))
+        .with_content_store(Arc::new(
+            nalarvo_application::content_store::LocalContentStore::open(&db.path().join("content"))
+                .unwrap(),
+        ));
     app.ensure_canonical_permissions("w").await.unwrap();
     let ctx = TrustedRunContext {
         run_id: "run".into(),
@@ -417,7 +421,7 @@ async fn real_provider_requires_current_lease_grant_permission_and_eligible_mode
             output,
             cost
         ),
-        ("model", "provider", Some("req-1"), Some(3), Some(4), None)
+        ("model", "provider", None, Some(3), Some(4), None)
     );
     let (usage_step, quantity, usage_cost): (String, i64, Option<f64>) = sqlx::query_as(
         "SELECT step_id,quantity,estimated_cost FROM usage_records WHERE run_id='run'",
@@ -455,7 +459,7 @@ async fn real_provider_requires_current_lease_grant_permission_and_eligible_mode
             limited.request_id.as_deref(),
             limited.status
         ),
-        ("HTTP 429", Some("req-429"), Some(429))
+        ("HTTP 429", None, Some(429))
     );
     let timed_out = call(ctx, request).await.unwrap_err();
     assert_eq!(timed_out.kind, ProviderErrorKind::Timeout);
@@ -484,7 +488,7 @@ async fn real_provider_requires_current_lease_grant_permission_and_eligible_mode
         (
             "FAILED",
             "PROVIDER_RATE_LIMIT",
-            Some("req-429"),
+            None,
             None,
             None,
             None,

@@ -247,6 +247,8 @@ async fn dispatch_inner(
     let tools = NativeTools::new(bound_root, std::iter::empty::<String>())
         .map_err(|e| format!("native tools init: {e}"))?;
     let canonical_root = tools.root().to_path_buf();
+    app.validate_project_content_boundary(&canonical_root)
+        .map_err(|_| "Content store is outside Tool authority".to_string())?;
     let mut prepared_shell = if proposal.tool_name == "shell.execute" {
         let executable = string_arg(&args, "executable")?;
         if proposal.target != executable {

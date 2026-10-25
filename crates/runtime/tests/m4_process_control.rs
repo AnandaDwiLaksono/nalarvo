@@ -232,7 +232,13 @@ async fn wait_terminal(pool: &SqlitePool, company_id: &CompanyId, run_id: &str) 
 }
 
 fn supervisor(pool: SqlitePool) -> RuntimeSupervisor {
-    let app = ApplicationContext::new(pool.clone()).with_secret_store(Arc::new(ControlSecrets));
+    let dir = tempfile::tempdir().unwrap().keep();
+    let app = ApplicationContext::new(pool.clone())
+        .with_secret_store(Arc::new(ControlSecrets))
+        .with_content_store(Arc::new(
+            nalarvo_application::content_store::LocalContentStore::open(&dir.join("content"))
+                .unwrap(),
+        ));
     RuntimeSupervisor::new(
         pool,
         SupervisorConfig {

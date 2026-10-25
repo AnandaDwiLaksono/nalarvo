@@ -27,10 +27,14 @@ use tracing::error;
 use uuid::Uuid;
 
 pub mod audit;
+pub mod content_store;
 pub mod credential_broker;
 pub mod m2;
 pub mod m4;
 pub mod m5;
+pub mod m6;
+pub mod m6_context;
+pub mod m6_information;
 #[cfg(windows)]
 pub mod project_filesystem;
 pub use audit::SqliteAuditSink;
@@ -355,6 +359,7 @@ pub struct ApplicationContext {
     pub audit_sink: Arc<dyn AuditSink>,
     pub(crate) durable_audit_sink: SqliteAuditSink,
     secret_store: Arc<dyn SecretStore>,
+    pub(crate) content_store: Option<Arc<dyn content_store::ContentStore>>,
 }
 
 macro_rules! m3_create {
@@ -539,6 +544,7 @@ impl ApplicationContext {
             event_broadcaster,
             audit_sink,
             secret_store,
+            content_store: None,
         }
     }
 
@@ -895,6 +901,9 @@ impl ApplicationContext {
             });
         }
         proj.bind_working_root(path, expected_version)?;
+        self.validate_project_content_boundary(std::path::Path::new(
+            proj.working_root_path.as_deref().unwrap_or(""),
+        ))?;
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE projects SET working_root_path = ?, working_root_bound_at = ?, row_version = row_version + 1, updated_at = ? WHERE company_id = ? AND id = ? AND row_version = ?",

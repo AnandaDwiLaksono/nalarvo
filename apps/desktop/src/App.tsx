@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import InformationPanel from "./InformationPanel";
 import { useEffect, useState } from "react";
 import "./app.css";
 
@@ -114,7 +115,8 @@ type Tab =
   | "Projects"
   | "Work"
   | "Runs"
-  | "Approvals";
+  | "Approvals"
+  | "Information";
 
 const DEFAULT_WORKSPACE_ID = "0191e4b8-0002-7000-8000-000000000001";
 
@@ -609,6 +611,7 @@ export default function App() {
                     "Work",
                     "Runs",
                     "Approvals",
+                    "Information",
                   ] as const
                 ).map((view) => (
                   <button
@@ -1188,6 +1191,22 @@ export default function App() {
                     </article>
                   )}
                 </section>
+              )}
+              {tab === "Runs" && activeProject && (
+                <InformationPanel
+                  key={`${activeCompany.id}:${activeProject.id}`}
+                  companyId={activeCompany.id}
+                  projectId={activeProject.id}
+                  runs={runs}
+                />
+              )}
+              {tab === "Information" && activeCompany && (
+                <InformationPanel
+                  key={`${activeCompany.id}:${activeProject?.id ?? ""}`}
+                  companyId={activeCompany.id}
+                  projectId={activeProject?.id}
+                  runs={runs}
+                />
               )}
               {tab === "Runs" && activeProject && (
                 <section aria-labelledby="runs-title">
