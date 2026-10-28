@@ -18,6 +18,13 @@ async fn setup_app() -> (ApplicationContext, CompanyId, String, String, String) 
         .unwrap()
         .id;
 
+    app.ensure_canonical_permissions("0191e4b8-0002-7000-8000-000000000001")
+        .await
+        .unwrap();
+    for permission in ["project.modify", "project.allocate_agent"] {
+        sqlx::query("INSERT INTO permission_grants(id,workspace_id,company_id,permission_definition_id,principal_type,principal_id,scope_type,scope_id,effect,created_at) VALUES(?,'0191e4b8-0002-7000-8000-000000000001',?,?,'USER','0191e4b8-0001-7000-8000-000000000001','COMPANY',?,'ALLOW','t')")
+            .bind(permission).bind(&company_id.0).bind(format!("pd_{permission}")).bind(&company_id.0).execute(&app.pool).await.unwrap();
+    }
     sqlx::query("UPDATE companies SET status='ACTIVE' WHERE id=?")
         .bind(&company_id.0)
         .execute(&app.pool)

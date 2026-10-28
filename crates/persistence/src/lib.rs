@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 pub mod m4;
 pub mod m5;
+pub mod model_dispatch;
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
@@ -56,6 +57,7 @@ pub async fn create_pool(database_url: &str) -> Result<SqlitePool, PersistenceEr
 }
 
 pub async fn run_migrations(pool: &SqlitePool) -> Result<(), PersistenceError> {
+    // Embed forward migrations, including M7 evaluation evidence, for fresh and upgraded databases.
     sqlx::migrate!("../../migrations").run(pool).await?;
     Ok(())
 }

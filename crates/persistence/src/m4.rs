@@ -116,7 +116,8 @@ pub struct UsageRecord {
 }
 
 pub async fn create_run(pool: &SqlitePool, run: &Run) -> Result<(), PersistenceError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_legacy_work_tx(&mut tx, &run.work_item_id).await?;
     insert_run_tx(&mut tx, run).await?;
     tx.commit().await?;
     Ok(())
@@ -127,7 +128,8 @@ pub async fn create_run_with_event(
     run: &Run,
     event: &DomainEvent,
 ) -> Result<(), PersistenceError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_legacy_work_tx(&mut tx, &run.work_item_id).await?;
     insert_run_tx(&mut tx, run).await?;
     insert_safe_event_tx(&mut tx, event).await?;
     tx.commit().await?;
@@ -166,7 +168,8 @@ pub async fn queue_run(
         return validation("job scope does not match run");
     }
     validate_json(&job.payload)?;
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_legacy_run_tx(&mut tx, company_id, run_id).await?;
     let governed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actions a JOIN runs r ON r.id=a.run_id WHERE r.id=? AND r.company_id=? AND r.lifecycle_state='WAITING_APPROVAL' AND a.authorization IN ('APPROVAL_REQUIRED','APPROVED','REJECTED','EXPIRED')")
         .bind(run_id).bind(&company_id.0).fetch_one(&mut *tx).await?;
     if governed != 0 {
@@ -423,7 +426,8 @@ pub async fn transition_run(
     failure_class: Option<&str>,
     failure_detail: Option<&str>,
 ) -> Result<Run, PersistenceError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_legacy_run_tx(&mut tx, company_id, run_id).await?;
     let run = transition_run_tx(
         &mut tx,
         company_id,
@@ -449,7 +453,7 @@ pub async fn transition_run_with_lease(
     failure_class: Option<&str>,
     failure_detail: Option<&str>,
 ) -> Result<Run, PersistenceError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     require_current_lease_tx(&mut tx, lease).await?;
     let run = transition_run_tx(
         &mut tx,
@@ -510,7 +514,7 @@ pub async fn append_step_with_lease(
     lease: &ExecutionLease,
     step: &ExecutionStep,
 ) -> Result<(), PersistenceError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     require_current_lease_tx(&mut tx, lease).await?;
     append_step_tx(&mut tx, step).await?;
     tx.commit().await?;
@@ -608,6 +612,28 @@ pub async fn append_model_outcome_with_lease(
     ) {
         crate::m5::settle_model_reservation_tx(&mut tx, &invocation.id, false).await?;
     }
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT status FROM model_dispatches WHERE id=?")
+            .bind(&invocation.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if state.as_deref() == Some("DISPATCHING") {
+        let unknown = matches!(
+            invocation.failure_class.as_deref(),
+            Some("PROVIDER_TIMEOUT" | "CANCELLED" | "PROVIDER_UNAVAILABLE")
+        );
+        crate::model_dispatch::transition_tx(
+            &mut tx,
+            &invocation.id,
+            "DISPATCHING",
+            if unknown {
+                "OUTCOME_UNKNOWN"
+            } else {
+                "RESOLVED"
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -699,6 +725,11 @@ pub async fn recover_orphaned_approval(
         return Ok(false);
     };
     if run.status != RunStatus::Running {
+        return Ok(false);
+    }
+    let unresolved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_dispatches WHERE run_id=? AND company_id=? AND status IN ('PREPARED','DISPATCHING','OUTCOME_UNKNOWN')")
+        .bind(run_id).bind(&company_id.0).fetch_one(&mut *tx).await?;
+    if unresolved != 0 {
         return Ok(false);
     }
     let leases = sqlx::query("SELECT worker_principal_id,expires_at,released_at,release_reason FROM run_execution_leases WHERE run_id=?")
@@ -985,7 +1016,8 @@ pub async fn cancel_run_with_result(
     if result.run_status != RunStatus::Cancelled {
         return validation("cancel result requires CANCELLED status");
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_legacy_run_tx(&mut tx, company_id, run_id).await?;
     let current = get_run_tx(&mut tx, company_id, run_id)
         .await?
         .ok_or_else(|| PersistenceError::NotFound(run_id.into()))?;
@@ -1046,7 +1078,8 @@ pub async fn timeout_run_with_result(
     ] {
         validate_optional_json(value.as_ref())?;
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_legacy_run_tx(&mut tx, company_id, run_id).await?;
     let current = get_run_tx(&mut tx, company_id, run_id)
         .await?
         .ok_or_else(|| PersistenceError::NotFound(run_id.into()))?;
@@ -1111,7 +1144,7 @@ pub async fn finalize_run_with_result_with_lease(
     result: &RuntimeResult,
     event: &DomainEvent,
 ) -> Result<Run, PersistenceError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     require_current_lease_tx(&mut tx, lease).await?;
     let run = transition_run_tx(
         &mut tx,
@@ -1172,7 +1205,8 @@ pub async fn store_terminal_result(
     result: &RuntimeResult,
     event: &DomainEvent,
 ) -> Result<(), PersistenceError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_legacy_run_tx(&mut tx, &result.company_id, &result.run_id).await?;
     store_terminal_result_tx(&mut tx, result, event).await?;
     tx.commit().await?;
     Ok(())
@@ -1213,8 +1247,13 @@ async fn store_terminal_result_tx(
     if run.status != result.run_status || !run.status.is_terminal() {
         return validation("terminal result does not match terminal run");
     }
+    crate::model_dispatch::reconcile_run_tx(tx, &result.company_id.0, &result.run_id).await?;
     sqlx::query("INSERT INTO runtime_results(id, company_id, run_id, run_status, result_summary, output_payload, output_metadata, resource_usage_summary, failure_class, failure_detail, warnings, correlation_id, causation_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&result.id).bind(&result.company_id.0).bind(&result.run_id).bind(result.run_status.to_string()).bind(&result.result_summary).bind(optional_json(result.output_payload.as_ref())?).bind(optional_json(result.output_metadata.as_ref())?).bind(optional_json(result.resource_usage_summary.as_ref())?).bind(&result.failure_class).bind(&result.failure_detail).bind(optional_json(result.warnings.as_ref())?).bind(&result.correlation_id).bind(&result.causation_id).bind(now()).execute(&mut **tx).await?;
+    sqlx::query("UPDATE durable_jobs SET status='COMPLETED',lease_owner=NULL,lease_until=NULL,updated_at=? WHERE run_id=? AND status IN ('PENDING','CLAIMED')")
+        .bind(now()).bind(&result.run_id).execute(&mut **tx).await?;
+    sqlx::query("UPDATE run_execution_leases SET released_at=?,release_reason='COMPLETED' WHERE run_id=? AND released_at IS NULL")
+        .bind(now()).bind(&result.run_id).execute(&mut **tx).await?;
     insert_safe_event_tx(tx, event).await?;
     Ok(())
 }
@@ -1226,7 +1265,9 @@ pub async fn retry_run(
     expected_version: i64,
     event: &DomainEvent,
 ) -> Result<Run, PersistenceError> {
-    let failed = get_run(pool, company_id, failed_run_id)
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    require_legacy_run_tx(&mut tx, company_id, failed_run_id).await?;
+    let failed = get_run_tx(&mut tx, company_id, failed_run_id)
         .await?
         .ok_or_else(|| PersistenceError::NotFound(failed_run_id.into()))?;
     if failed.row_version != expected_version {
@@ -1236,14 +1277,41 @@ pub async fn retry_run(
         });
     }
     let retry = failed.retry()?;
-    let mut tx = pool.begin().await?;
     insert_run_tx(&mut tx, &retry).await?;
     insert_safe_event_tx(&mut tx, event).await?;
     tx.commit().await?;
     Ok(retry)
 }
 
-async fn insert_run_tx(
+/// Legacy commands cannot mutate M7 work. Governed application transactions and
+/// lease-fenced runtime operations remain the only M7 mutation paths.
+pub async fn require_legacy_work_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+) -> Result<(), PersistenceError> {
+    let configured: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_requirements WHERE work_item_id=?")
+            .bind(work_item_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if configured != 0 {
+        return validation("M7 work requires governed orchestration or lease-fenced runtime");
+    }
+    Ok(())
+}
+
+async fn require_legacy_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    company_id: &CompanyId,
+    run_id: &str,
+) -> Result<(), PersistenceError> {
+    let run = get_run_tx(tx, company_id, run_id)
+        .await?
+        .ok_or_else(|| PersistenceError::NotFound(run_id.into()))?;
+    require_legacy_work_tx(tx, &run.work_item_id).await
+}
+
+pub async fn insert_run_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run: &Run,
 ) -> Result<(), PersistenceError> {

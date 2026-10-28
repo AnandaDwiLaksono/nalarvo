@@ -74,7 +74,7 @@ impl ApplicationContext {
         Self::evaluate_action_authority_connection(&mut connection, cmd).await
     }
 
-    async fn evaluate_action_authority_connection(
+    pub async fn evaluate_action_authority_connection(
         connection: &mut sqlx::SqliteConnection,
         cmd: &ProposeActionCommand,
     ) -> Result<AuthorityDecision, ApplicationError> {
@@ -91,10 +91,12 @@ impl ApplicationContext {
             .ok_or(ApplicationError::Unauthorized)?;
         if let Some(project) = &cmd.project_id {
             let valid: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM projects WHERE id=? AND company_id=? AND status='ACTIVE'",
+                "SELECT COUNT(*) FROM projects WHERE id=? AND company_id=? AND (status='ACTIVE' OR (? IN ('project.modify','project.allocate_agent') AND ? IS NULL AND status IN ('DRAFT','STAFFING','PAUSED')))",
             )
             .bind(project)
             .bind(&cmd.company_id)
+            .bind(&cmd.action_type)
+            .bind(&cmd.run_id)
             .fetch_one(&mut *connection)
             .await?;
             if valid != 1 {
@@ -860,7 +862,7 @@ impl ApplicationContext {
             .bind(cmd.actor.principal_type.to_string()).bind(&cmd.actor.principal_id).bind(decision)
             .bind(Utc::now().to_rfc3339()).execute(&mut **tx).await?;
         sqlx::query("UPDATE actions SET project_id=?, work_item_id=(SELECT work_item_id FROM runs WHERE id=actions.run_id), agent_id=(SELECT executing_agent_id FROM runs WHERE id=actions.run_id), worker_principal_id=?, tool_id=?, tool_version=?, fingerprint=?, correlation_id=?, causation_id=? WHERE id=?")
-            .bind(if cmd.run_id.is_some() { cmd.project_id.as_deref() } else { None })
+            .bind(cmd.project_id.as_deref())
             .bind(cmd.parameters.as_ref().and_then(|p| p["worker_principal_id"].as_str()))
             .bind(cmd.parameters.as_ref().and_then(|p| p["tool_id"].as_str()))
             .bind(cmd.parameters.as_ref().and_then(|p| p["tool_version"].as_str()))
@@ -1882,10 +1884,12 @@ impl ApplicationContext {
         }
         if let Some(project) = project_id {
             let active: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM projects WHERE id=? AND company_id=? AND status='ACTIVE'",
+                "SELECT COUNT(*) FROM projects WHERE id=? AND company_id=? AND (status='ACTIVE' OR (? IN ('project.modify','project.allocate_agent') AND ? IS NULL AND status IN ('DRAFT','STAFFING','PAUSED')))",
             )
             .bind(project)
             .bind(company_id)
+            .bind(&command.action_type)
+            .bind(&command.run_id)
             .fetch_one(&mut *tx)
             .await?;
             if active != 1 {
@@ -2316,6 +2320,7 @@ impl ApplicationContext {
         }
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        nalarvo_persistence::m4::require_legacy_work_tx(&mut tx, &run.work_item_id).await?;
         let updated = nalarvo_persistence::m4::transition_run_tx(
             &mut tx,
             company_id,

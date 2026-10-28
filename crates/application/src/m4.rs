@@ -107,6 +107,12 @@ impl ApplicationContext {
                     "Only failed or timed out runs can be retried".into(),
                 ));
             }
+            let unknown:i64=sqlx::query_scalar("SELECT COUNT(*) FROM actions WHERE run_id=? AND status IN ('STARTED','EXECUTING','OUTCOME_UNKNOWN')").bind(retry_id).fetch_one(&self.pool).await?;
+            if unknown != 0 || old.failure_class.as_deref() == Some("OUTCOME_UNKNOWN") {
+                return Err(ApplicationError::Validation(
+                    "Unknown external outcome requires reconciliation, not retry".into(),
+                ));
+            }
             if old.work_item_id != cmd.work_item_id
                 || old.executing_agent_id != cmd.executing_agent_id
                 || old.assignment_id != cmd.assignment_id
@@ -128,7 +134,8 @@ impl ApplicationContext {
             cmd.company_id.0, cmd.project_id, principal.principal_id
         );
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        nalarvo_persistence::m4::require_legacy_work_tx(&mut tx, &cmd.work_item_id).await?;
 
         if let Some(ref key) = cmd.meta.idempotency_key {
             let check = check_idempotency_tx(&mut tx, &idempotency_scope, key, &req_hash).await?;
@@ -281,6 +288,7 @@ impl ApplicationContext {
             .unwrap_or_else(|| Uuid::now_v7().to_string());
 
         let run = self.get_run(company_id, project_id, run_id).await?;
+        self.require_legacy_run(&run).await?;
         let idempotency_scope = format!(
             "company:{}:{}:{}:QueueRun",
             company_id.0, project_id, principal.principal_id
@@ -417,6 +425,7 @@ impl ApplicationContext {
         expected_version: i64,
     ) -> Result<Run, ApplicationError> {
         let run = self.get_run(company_id, project_id, run_id).await?;
+        self.require_legacy_run(&run).await?;
         if run.row_version != expected_version {
             return Err(ApplicationError::StaleVersion {
                 current: run.row_version,
@@ -637,6 +646,7 @@ impl ApplicationContext {
         reason: Option<String>,
     ) -> Result<Run, ApplicationError> {
         let run = self.get_run(company_id, project_id, run_id).await?;
+        self.require_legacy_run(&run).await?;
 
         // Duplicate-safe cancellation
         if run.status == RunStatus::Cancelled {
@@ -1049,7 +1059,8 @@ impl ApplicationContext {
         run.reject_admission("ADMISSION_REJECTED".into(), detail.into())?;
 
         let now_str = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        nalarvo_persistence::m4::require_legacy_work_tx(&mut tx, &run.work_item_id).await?;
         let result = sqlx::query(
             "UPDATE runs SET lifecycle_state = 'FAILED', failure_class = 'ADMISSION_REJECTED', failure_detail = ?, completed_at = ?, updated_at = ?, row_version = row_version + 1 WHERE id = ? AND company_id = ? AND row_version = ?"
         )
@@ -1109,6 +1120,12 @@ impl ApplicationContext {
         self.get_run(company_id, project_id, run_id).await
     }
 
+    async fn require_legacy_run(&self, run: &Run) -> Result<(), ApplicationError> {
+        let mut tx = self.pool.begin().await?;
+        nalarvo_persistence::m4::require_legacy_work_tx(&mut tx, &run.work_item_id).await?;
+        Ok(())
+    }
+
     async fn validate_run_scope(
         &self,
         company_id: &CompanyId,
@@ -1155,7 +1172,7 @@ impl ApplicationContext {
         Ok(())
     }
 
-    async fn check_admission(&self, run: &Run) -> Result<(), (String, String)> {
+    pub(crate) async fn check_admission(&self, run: &Run) -> Result<(), (String, String)> {
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM companies c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=? AND c.status='ACTIVE' AND w.status='ACTIVE'")
             .bind(&run.company_id.0).fetch_one(&self.pool).await.map_err(|e| ("ADMISSION_REJECTED".into(),e.to_string()))?;
         if active != 1 {
@@ -1208,6 +1225,17 @@ impl ApplicationContext {
             ));
         }
 
+        let configured: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_requirements WHERE company_id=? AND project_id=? AND work_item_id=?")
+            .bind(&run.company_id.0).bind(&run.project_id).bind(&run.work_item_id).fetch_one(&self.pool).await.map_err(|e| ("ADMISSION_REJECTED".into(),e.to_string()))?;
+        if configured != 0
+            && !self
+                .work_readiness(&run.company_id.0, &run.project_id, &run.work_item_id)
+                .await
+                .map_err(|e| ("ADMISSION_REJECTED".into(), e.to_string()))?
+                .ready
+        {
+            return Err(("ADMISSION_REJECTED".into(), "Work readiness revoked".into()));
+        }
         // 3. Agent check
         let agent_row = sqlx::query(
             "SELECT status, model_profile_id FROM agents WHERE id = ? AND company_id = ?",

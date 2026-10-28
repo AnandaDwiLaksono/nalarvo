@@ -46,6 +46,7 @@ use tokio_stream::StreamExt;
 pub mod m4;
 pub mod m5;
 pub mod m6;
+pub mod m7;
 use tokio_stream::wrappers::BroadcastStream;
 
 #[derive(Clone)]
@@ -230,6 +231,7 @@ pub fn router_with_app(token: impl Into<Arc<str>>, app_ctx: Option<ApplicationCo
         .route("/api/v1/events", get(events_sse))
         .merge(m4::routes())
         .merge(m6::routes())
+        .merge(m7::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -1612,6 +1614,7 @@ async fn get_work_item(
 
 fn m3_meta(headers: &HeaderMap) -> nalarvo_application::CommandMeta {
     nalarvo_application::CommandMeta {
+        principal: Some(default_principal()),
         idempotency_key: headers
             .get("idempotency-key")
             .and_then(|v| v.to_str().ok())
@@ -1624,7 +1627,6 @@ fn m3_meta(headers: &HeaderMap) -> nalarvo_application::CommandMeta {
             .get("x-causation-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
-        ..Default::default()
     }
 }
 
@@ -1882,6 +1884,12 @@ async fn create_agent_allocation(
 }
 
 macro_rules! m3_action {
+    (@call transition_agent_allocation, $ctx:expr, $company:expr, $project:expr, $id:expr, $status:expr, $version:expr, $meta:expr) => {
+        $ctx.transition_agent_allocation_with_meta($company, $project, $id, $status, $version, $meta).await
+    };
+    (@call $method:ident, $ctx:expr, $company:expr, $project:expr, $id:expr, $status:expr, $version:expr, $meta:expr) => {
+        { let _ = &$meta; $ctx.$method($company, $project, $id, $status, $version).await }
+    };
     ($handler:ident, $request:ty, $method:ident, $variant:ident, {$($action:literal => $status:expr),+ $(,)?}) => {
         async fn $handler(State(state): State<ApiState>, Path((company, project, id)): Path<(String, String, String)>, req: Request) -> Response {
             let Some(ctx) = state.app_ctx.as_ref() else { return service_unavailable(); };
@@ -1889,9 +1897,10 @@ macro_rules! m3_action {
                 $(Some((clean, $action)) => (clean, $status),)+
                 _ => return unknown_action(),
             };
+            let meta = m3_meta(req.headers());
             let Ok(body) = axum::body::to_bytes(req.into_body(), 64 * 1024).await else { return (StatusCode::BAD_REQUEST, "Invalid body").into_response(); };
             let Ok(payload) = serde_json::from_slice::<$request>(&body) else { return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response(); };
-            match ctx.$method(&CompanyId(company), &project, clean, status, payload.expected_version).await {
+            match m3_action!(@call $method, ctx, &CompanyId(company), &project, clean, status, payload.expected_version, meta) {
                 Ok(v) => (StatusCode::OK, Json(m3_dto!($variant, v))).into_response(),
                 Err(e) => map_app_error(e),
             }
@@ -2001,13 +2010,27 @@ async fn get_work_dependency(
 
 async fn delete_work_dependency(
     State(state): State<ApiState>,
-    Path((company, project, _work_id, dependency_id)): Path<(String, String, String, String)>,
+    Path((company, project, work_id, dependency_id)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(ctx) = state.app_ctx.as_ref() else {
         return service_unavailable();
     };
+    let company = CompanyId(company);
     match ctx
-        .delete_work_dependency(&CompanyId(company), &project, &dependency_id)
+        .get_work_dependency(&company, &project, &dependency_id)
+        .await
+    {
+        Ok(v) if v.work_item_id == work_id => {}
+        Ok(_) => {
+            return map_app_error(nalarvo_application::ApplicationError::NotFound(
+                dependency_id,
+            ));
+        }
+        Err(e) => return map_app_error(e),
+    }
+    match ctx
+        .delete_work_dependency_with_meta(&company, &project, &dependency_id, m3_meta(&headers))
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

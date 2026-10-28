@@ -2492,8 +2492,10 @@ dependencies = [
  "chrono",
  "futures-util",
  "nalarvo-application",
+ "nalarvo-client",
  "nalarvo-contracts",
  "nalarvo-domain",
+ "nalarvo-local-api",
  "nalarvo-model-gateway",
  "nalarvo-persistence",
  "reqwest 0.12.28",
@@ -2506,6 +2508,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "windows-sys 0.61.2",
 ]

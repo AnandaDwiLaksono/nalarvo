@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import InformationPanel from "./InformationPanel";
+import OrchestrationPanel from "./OrchestrationPanel";
 import { useEffect, useState } from "react";
 import "./app.css";
 
@@ -848,6 +849,23 @@ export default function App() {
                   {activeProject && (
                     <article aria-label="Project detail">
                       <h3>{activeProject.name}</h3>
+                      <OrchestrationPanel
+                        key={`${activeCompany.id}:${activeProject.id}`}
+                        companyId={activeCompany.id}
+                        projectId={activeProject.id}
+                        projectStatus={activeProject.status}
+                        workItems={workItems.filter(
+                          (w) => w.project_id === activeProject.id,
+                        )}
+                        version={activeProject.row_version}
+                        refresh={async () => {
+                          await Promise.all([
+                            loadWorkforce(activeCompany.id),
+                            loadWorkItems(activeCompany.id, activeProject.id),
+                            loadRuns(activeCompany.id, activeProject.id),
+                          ]);
+                        }}
+                      />
                       <p>
                         {activeProject.status} · version{" "}
                         {activeProject.row_version}

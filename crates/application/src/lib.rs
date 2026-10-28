@@ -35,6 +35,12 @@ pub mod m5;
 pub mod m6;
 pub mod m6_context;
 pub mod m6_information;
+pub mod m7;
+pub mod m7_completion;
+pub mod m7_evaluation;
+mod m7_governance;
+pub mod m7_plan;
+pub mod m7_work;
 #[cfg(windows)]
 pub mod project_filesystem;
 pub use audit::SqliteAuditSink;
@@ -387,7 +393,15 @@ macro_rules! m3_create {
             $company_id.0, $project_id, principal.principal_id, $action
         );
 
-        let mut tx = $self.pool.begin().await?;
+        let mut tx = $self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let governance = crate::m7_governance::legacy_mutation(
+            &mut tx, &$company_id, &$project_id, &$meta, $entity_type,
+            serde_json::json!({"command": $action, "request": &$cmd}),
+        ).await?;
+        if $entity_type == "WorkDependency" {
+            let value = serde_json::to_value(&$cmd).map_err(|e| ApplicationError::Validation(e.to_string()))?;
+            crate::m7_governance::mutable_work(&mut tx, &$company_id.0, &$project_id, value["work_item_id"].as_str().ok_or(ApplicationError::Unauthorized)?).await?;
+        }
 
         if let Some(ref key) = $meta.idempotency_key {
             let check = check_idempotency_tx(&mut tx, &idempotency_scope, key, &req_hash).await?;
@@ -417,7 +431,7 @@ macro_rules! m3_create {
             payload: serde_json::to_value(&$entity)
                 .map_err(|e| ApplicationError::Validation(e.to_string()))?,
         };
-        insert_domain_event_and_outbox_tx(&mut tx, &event).await?;
+        crate::m7::event(&mut tx, &governance, &event.event_type, &event.aggregate_type, &event.aggregate_id, event.aggregate_version, event.payload).await?;
 
         if let Some(ref key) = $meta.idempotency_key {
             let body = serde_json::to_string(&$entity)
@@ -451,11 +465,34 @@ fn dependency_id(company: &CompanyId, project: &str, work_item: &str, depends_on
 
 macro_rules! m3_transition {
     ($self:expr, $company:expr, $project:expr, $entity_type:expr, $entity_id:expr, $new_version:expr, $status_str:expr, |$tx:ident| $update:expr) => {{
-        let principal = PrincipalRef::user("0191e4b8-0001-7000-8000-000000000001");
+        m3_transition!($self, $company, $project, $entity_type, $entity_id, $new_version, $status_str, CommandMeta::default(), |$tx| $update)
+    }};
+    ($self:expr, $company:expr, $project:expr, $entity_type:expr, $entity_id:expr, $new_version:expr, $status_str:expr, $meta:expr, |$tx:ident| $update:expr) => {{
+        let meta = $meta;
+        let principal = meta.principal.clone().unwrap_or_else(|| PrincipalRef::user("0191e4b8-0001-7000-8000-000000000001"));
         let correlation_id = Uuid::now_v7().to_string();
         let causation_id = correlation_id.clone();
 
-        let mut tx = $self.pool.begin().await?;
+        let mut tx = $self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let governance = crate::m7_governance::legacy_mutation(
+            &mut tx, $company, $project, &meta, $entity_type,
+            serde_json::json!({"entity":$entity_type,"id":$entity_id,"status":$status_str,"expected_version":$new_version-1}),
+        ).await?;
+        if $entity_type == "WorkItem" {
+            if $status_str == "COMPLETED" {
+                let configured: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_requirements WHERE work_item_id=?")
+                    .bind($entity_id).fetch_one(&mut *tx).await?;
+                if configured != 0 { return Err(ApplicationError::Validation("Configured work requires governed acceptance".into())); }
+            }
+            let immutable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items WHERE id=? AND (status='COMPLETED' OR EXISTS(SELECT 1 FROM work_evaluations WHERE work_item_id=? AND accepted=1))")
+                .bind($entity_id).bind($entity_id).fetch_one(&mut *tx).await?;
+            if immutable != 0 { return Err(ApplicationError::Validation("Accepted work history is immutable".into())); }
+        }
+        if $entity_type == "AgentAllocation" {
+            let busy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assignments a WHERE a.agent_allocation_id=? AND a.status='ACTIVE'")
+                .bind($entity_id).fetch_one(&mut *tx).await?;
+            if busy != 0 && matches!($status_str.as_ref(), "RELEASED" | "CANCELLED") { return Err(ApplicationError::Validation("Allocation has active assignments".into())); }
+        }
         let $tx = &mut tx;
         $update.await?;
 
@@ -478,7 +515,7 @@ macro_rules! m3_transition {
                 "row_version": $new_version,
             }),
         };
-        insert_domain_event_and_outbox_tx(&mut tx, &event).await?;
+        crate::m7::event(&mut tx, &governance, &event.event_type, &event.aggregate_type, &event.aggregate_id, event.aggregate_version, event.payload).await?;
 
         tx.commit().await?;
 
@@ -1114,9 +1151,10 @@ impl ApplicationContext {
             });
         }
         proj.complete(expected_version)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now_str = proj.updated_at.to_rfc3339();
 
+        crate::m7_completion::completion_guard(&mut tx, &company_id.0, project_id).await?;
         // 1. Release active allocations
         sqlx::query(
             "UPDATE agent_allocations SET status = 'RELEASED', row_version = row_version + 1, ended_at = ?, updated_at = ? WHERE company_id = ? AND project_id = ? AND status IN ('PLANNED', 'ACTIVE', 'PAUSED')",
@@ -1485,23 +1523,35 @@ impl ApplicationContext {
                 expected,
             });
         }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let governance = crate::m7_governance::legacy_mutation(
+            &mut tx,
+            company,
+            project,
+            &CommandMeta::default(),
+            "StaffingRequirement",
+            serde_json::json!({"reconcile_requirement":id,"expected_version":expected}),
+        )
+        .await?;
         let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_allocations WHERE company_id = ? AND project_id = ? AND staffing_requirement_id = ? AND status = 'ACTIVE'")
-            .bind(&company.0).bind(project).bind(id).fetch_one(&self.pool).await?;
+            .bind(&company.0).bind(project).bind(id).fetch_one(&mut *tx).await?;
         let old_status = requirement.status;
         requirement.reconcile(active as u32);
         if requirement.status != old_status {
             let status = requirement.status;
-            m3_transition!(
-                self,
-                company,
-                project,
+            update_staffing_requirement_status_tx(&mut tx, company, id, status, expected).await?;
+            crate::m7::event(
+                &mut tx,
+                &governance,
+                "StaffingRequirementStatusChanged",
                 "StaffingRequirement",
                 id,
                 requirement.row_version,
-                status.to_string(),
-                |tx| update_staffing_requirement_status_tx(tx, company, id, status, expected)
-            )?;
+                serde_json::json!({"status":status.to_string()}),
+            )
+            .await?;
         }
+        tx.commit().await?;
         Ok(requirement)
     }
 
@@ -1676,10 +1726,36 @@ impl ApplicationContext {
         project: &str,
         id: &str,
     ) -> Result<(), ApplicationError> {
+        self.delete_work_dependency_with_meta(company, project, id, CommandMeta::default())
+            .await
+    }
+
+    pub async fn delete_work_dependency_with_meta(
+        &self,
+        company: &CompanyId,
+        project: &str,
+        id: &str,
+        meta: CommandMeta,
+    ) -> Result<(), ApplicationError> {
         let dependency = self.get_work_dependency(company, project, id).await?;
         let correlation_id = Uuid::now_v7().to_string();
-        let principal = PrincipalRef::user("0191e4b8-0001-7000-8000-000000000001");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let governance = crate::m7_governance::legacy_mutation(
+            &mut tx,
+            company,
+            project,
+            &meta,
+            "WorkDependency",
+            serde_json::json!({"delete_dependency":id}),
+        )
+        .await?;
+        crate::m7_governance::mutable_work(&mut tx, &company.0, project, &dependency.work_item_id)
+            .await?;
+        let principal = governance
+            .meta
+            .principal
+            .clone()
+            .ok_or(ApplicationError::Unauthorized)?;
         let result = sqlx::query("DELETE FROM work_dependencies WHERE company_id = ? AND project_id = ? AND work_item_id = ? AND depends_on_work_item_id = ?")
             .bind(&company.0).bind(project).bind(&dependency.work_item_id).bind(&dependency.depends_on_work_item_id).execute(&mut *tx).await?;
         if result.rows_affected() == 0 {
@@ -1701,7 +1777,16 @@ impl ApplicationContext {
             payload: serde_json::to_value(&dependency)
                 .map_err(|e| ApplicationError::Validation(e.to_string()))?,
         };
-        insert_domain_event_and_outbox_tx(&mut tx, &event).await?;
+        crate::m7::event(
+            &mut tx,
+            &governance,
+            &event.event_type,
+            &event.aggregate_type,
+            &event.aggregate_id,
+            event.aggregate_version,
+            event.payload,
+        )
+        .await?;
         tx.commit().await?;
         self.audit_sink.record(AuditRecord {
             audit_id: Uuid::now_v7().to_string(),
@@ -1761,17 +1846,54 @@ impl ApplicationContext {
         let alloc = self
             .get_agent_allocation(company, project, allocation_id)
             .await?;
-        self.release_work_assignment(company, project, id, expected)
-            .await?;
-        self.create_work_assignment(CreateWorkAssignmentCommand::new(
-            company.clone(),
-            project.into(),
-            old.work_item_id,
-            alloc.agent_id,
-            allocation_id.into(),
-            old.is_primary,
-        ))
-        .await
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let governance = crate::m7_governance::legacy_mutation(&mut tx, company, project, &CommandMeta::default(), "WorkAssignment", serde_json::json!({"reassign":id,"allocation_id":allocation_id,"expected_version":expected})).await?;
+        let now = Utc::now();
+        let assignment = WorkAssignment {
+            id: Uuid::now_v7().to_string(),
+            company_id: company.clone(),
+            project_id: project.into(),
+            work_item_id: old.work_item_id,
+            agent_id: alloc.agent_id,
+            is_primary: old.is_primary,
+            status: AssignmentStatus::Active,
+            row_version: 1,
+            created_at: now,
+            updated_at: now,
+            released_at: None,
+        };
+        update_work_assignment_status_tx(
+            &mut tx,
+            company,
+            id,
+            AssignmentStatus::Released,
+            expected,
+        )
+        .await?;
+        insert_work_assignment_tx(&mut tx, &assignment, allocation_id).await?;
+        crate::m7::event(
+            &mut tx,
+            &governance,
+            "WorkAssignmentStatusChanged",
+            "WorkAssignment",
+            id,
+            expected + 1,
+            serde_json::json!({"status":"RELEASED"}),
+        )
+        .await?;
+        crate::m7::event(
+            &mut tx,
+            &governance,
+            "WorkAssignmentCreated",
+            "WorkAssignment",
+            &assignment.id,
+            1,
+            serde_json::to_value(&assignment)
+                .map_err(|e| ApplicationError::Validation(e.to_string()))?,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(assignment)
     }
 
     pub async fn create_work_assignment(
@@ -2004,6 +2126,27 @@ impl ApplicationContext {
         status: AgentAllocationStatus,
         expected: i64,
     ) -> Result<AgentAllocation, ApplicationError> {
+        self.transition_agent_allocation_with_meta(
+            company,
+            project,
+            id,
+            status,
+            expected,
+            CommandMeta::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transition_agent_allocation_with_meta(
+        &self,
+        company: &CompanyId,
+        project: &str,
+        id: &str,
+        status: AgentAllocationStatus,
+        expected: i64,
+        meta: CommandMeta,
+    ) -> Result<AgentAllocation, ApplicationError> {
         let mut v = persistence::get_agent_allocation(&self.pool, company, id)
             .await?
             .filter(|v| v.project_id == project)
@@ -2054,6 +2197,7 @@ impl ApplicationContext {
             id,
             new_version,
             &status_str,
+            meta,
             |tx| update_agent_allocation_status_tx(tx, company, id, status, expected)
         )?;
         Ok(v)

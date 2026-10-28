@@ -23,6 +23,7 @@ use serde::de::DeserializeOwned;
 
 pub mod m4;
 pub mod m6;
+pub mod m7;
 pub use m4::*;
 
 #[derive(Debug, thiserror::Error)]

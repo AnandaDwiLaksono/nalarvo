@@ -143,6 +143,16 @@ async fn execute(
     {
         return Err(denied());
     }
+    let configured:i64=sqlx::query_scalar("SELECT COUNT(*) FROM work_requirements WHERE company_id=? AND project_id=? AND work_item_id=?").bind(&ctx.company_id).bind(&project).bind(&item).fetch_one(&app.pool).await.map_err(|_|denied())?;
+    if configured != 0
+        && !app
+            .work_readiness(&ctx.company_id, &project, &item)
+            .await
+            .map_err(|_| denied())?
+            .ready
+    {
+        return Err(denied());
+    }
     let allocated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_allocations WHERE company_id = ? AND project_id = ? AND agent_id = ? AND status = 'ACTIVE'")
         .bind(&ctx.company_id).bind(&project).bind(&agent).fetch_one(&app.pool).await.map_err(|_| denied())?;
     if allocated == 0 {
@@ -161,11 +171,12 @@ async fn execute(
         .or(agent_profile.as_deref())
         .ok_or_else(denied)?;
     let binding = sqlx::query(
-        "SELECT pv.profile_id, pv.version, m.id AS model_id, pc.id AS provider_connection_id, pc.credential_ref_id, pc.endpoint, pc.provider_kind
+        "SELECT pv.profile_id, pv.version, m.id AS model_id, pc.id AS provider_connection_id, pc.credential_ref_id, pc.endpoint, pc.provider_kind, pc.row_version AS provider_epoch, cr.row_version AS credential_epoch
          FROM model_profiles mp
          JOIN model_profile_versions pv ON pv.profile_id = mp.id AND pv.workspace_id = mp.workspace_id AND pv.version = mp.current_version
          JOIN models m ON m.id = pv.model_id AND m.workspace_id = pv.workspace_id
          JOIN provider_connections pc ON pc.id = m.provider_connection_id AND pc.workspace_id = m.workspace_id
+         JOIN credential_refs cr ON cr.id=pc.credential_ref_id AND cr.workspace_id=pc.workspace_id AND cr.status='ACTIVE'
          WHERE mp.workspace_id = ? AND mp.status = 'ACTIVE' AND m.status = 'ACTIVE'
            AND pc.status = 'ENABLED' AND m.model_key = ?
            AND (mp.id = ? OR mp.id || ':' || pv.version = ?)"
@@ -218,6 +229,13 @@ async fn execute(
     let workspace_for_usage = workspace.clone();
     let invocation_id = Uuid::now_v7().to_string();
     let lease = current_lease(app, &ctx).await?;
+    let step_id = nalarvo_persistence::m4::resolve_tool_step(
+        &app.pool,
+        &lease,
+        &CompanyId(ctx.company_id.clone()),
+    )
+    .await
+    .map_err(|_| denied())?;
     let mut tx = app
         .pool
         .begin_with("BEGIN IMMEDIATE")
@@ -226,6 +244,12 @@ async fn execute(
     nalarvo_persistence::m4::require_current_lease_tx(&mut tx, &lease)
         .await
         .map_err(|_| denied())?;
+    sqlx::query("INSERT INTO model_dispatches(id,workspace_id,company_id,project_id,run_id,step_id,provider_connection_id,credential_ref_id,provider_epoch,credential_epoch,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,'PREPARED',?,?)")
+        .bind(&invocation_id).bind(&workspace).bind(&ctx.company_id).bind(&project).bind(&ctx.run_id).bind(&step_id)
+        .bind(binding.get::<String,_>("provider_connection_id")).bind(&credential)
+        .bind(binding.get::<i64,_>("provider_epoch")).bind(binding.get::<i64,_>("credential_epoch"))
+        .bind(Utc::now().to_rfc3339()).bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx).await.map_err(|_| denied())?;
     let budgets = nalarvo_persistence::m5::applicable_budgets(
         &mut tx,
         &workspace,
@@ -249,10 +273,11 @@ async fn execute(
     }
     for budget in budgets {
         let id: String = budget.get("id");
+        let reservation_id = format!("model:{invocation_id}:{id}");
         nalarvo_persistence::m5::hold_budget_tx(
             &mut tx,
             &nalarvo_persistence::m5::BudgetReservation {
-                id: format!("model:{invocation_id}:{id}"),
+                id: reservation_id.clone(),
                 budget_id: id,
                 action_id: None,
                 workspace_id: workspace.clone(),
@@ -265,15 +290,31 @@ async fn execute(
         )
         .await
         .map_err(|_| denied())?;
+        sqlx::query("UPDATE resource_reservations SET model_dispatch_id=? WHERE id=?")
+            .bind(&invocation_id)
+            .bind(&reservation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| denied())?;
     }
+    nalarvo_persistence::model_dispatch::record_tx(
+        &mut tx,
+        &invocation_id,
+        &ctx.company_id,
+        &project,
+        &ctx.run_id,
+        "PREPARED",
+    )
+    .await
+    .map_err(|_| denied())?;
     tx.commit().await.map_err(|_| denied())?;
     let secret = app
         .credential_broker()
         .resolve_for_core(CredentialBrokerRequest {
-            workspace_id: workspace,
+            workspace_id: workspace.clone(),
             company_id: ctx.company_id.clone(),
             principal: PrincipalRef::system(&ctx.worker_principal_id),
-            credential_ref_id: credential,
+            credential_ref_id: credential.clone(),
             model_profile_id: profile_id.clone(),
             action: "credential.use".into(),
             tool: "model.invoke".into(),
@@ -337,14 +378,76 @@ async fn execute(
     // Selected credential stays in the trusted adapter Authorization header only.
     // Never forward provider errors verbatim: transport diagnostics can contain credentials.
     let started_at = Utc::now();
-    let result = provider
-        .complete(request, token, Duration::from_secs(30), cancel.clone())
+    // Durable intent precedes any transport poll. A crash here is conservatively unknown.
+    let mut tx = app
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
         .await
-        .map_err(safe_provider_error)
-        .map(|mut response| {
-            response.request_id = None;
-            response
-        });
+        .map_err(|_| denied())?;
+    nalarvo_persistence::model_dispatch::transition_tx(
+        &mut tx,
+        &invocation_id,
+        "PREPARED",
+        "DISPATCHING",
+    )
+    .await
+    .map_err(|_| denied())?;
+    tx.commit().await.map_err(|_| denied())?;
+    let mut tx = app
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|_| denied())?;
+    let admission = async {
+        nalarvo_persistence::m4::require_current_lease_tx(&mut tx, &lease).await.map_err(|_| denied())?;
+        let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM model_dispatches d JOIN provider_connections p ON p.id=d.provider_connection_id AND p.workspace_id=d.workspace_id JOIN credential_refs c ON c.id=d.credential_ref_id AND c.workspace_id=d.workspace_id JOIN model_profiles mp ON mp.id=? AND mp.workspace_id=d.workspace_id JOIN model_profile_versions v ON v.profile_id=mp.id AND v.version=mp.current_version JOIN models m ON m.id=v.model_id AND m.workspace_id=d.workspace_id JOIN company_workspace_resource_grants g ON g.company_id=d.company_id AND g.workspace_id=d.workspace_id AND g.model_profile_id=mp.id JOIN companies co ON co.id=d.company_id AND co.workspace_id=d.workspace_id JOIN workspaces w ON w.id=d.workspace_id JOIN projects pr ON pr.id=d.project_id AND pr.company_id=d.company_id JOIN runs r ON r.id=d.run_id AND r.company_id=d.company_id JOIN agents a ON a.id=r.executing_agent_id AND a.company_id=d.company_id JOIN work_items wi ON wi.id=r.work_item_id AND wi.company_id=d.company_id WHERE d.id=? AND d.status='DISPATCHING' AND p.status='ENABLED' AND c.status='ACTIVE' AND p.row_version=d.provider_epoch AND c.row_version=d.credential_epoch AND p.credential_ref_id=c.id AND p.endpoint=? AND mp.status='ACTIVE' AND v.version=? AND m.id=? AND m.status='ACTIVE' AND m.provider_connection_id=p.id AND co.status='ACTIVE' AND w.status='ACTIVE' AND pr.status='ACTIVE' AND r.lifecycle_state='RUNNING' AND a.status='ACTIVE' AND wi.status IN ('READY','IN_PROGRESS','BLOCKED')")
+            .bind(&profile_id).bind(&invocation_id).bind(&endpoint).bind(version).bind(binding.get::<String,_>("model_id"))
+            .fetch_one(&mut *tx).await.map_err(|_| denied())?;
+        if valid != 1 || *cancel.borrow() { return Err(denied()); }
+        let mut credential_action = provider_action.clone();
+        credential_action.action_type = "credential.use".into();
+        credential_action.target = credential.clone();
+        for action in [&provider_action, &credential_action] {
+            if ApplicationContext::evaluate_action_authority_connection(&mut tx, action).await.map_err(|_| denied())? != AuthorityDecision::Allow {
+                return Err(denied());
+            }
+        }
+        Ok(())
+    }.await;
+    if admission.is_err() {
+        nalarvo_persistence::model_dispatch::transition_tx(
+            &mut tx,
+            &invocation_id,
+            "DISPATCHING",
+            "ABORTED",
+        )
+        .await
+        .map_err(|_| denied())?;
+        nalarvo_persistence::m5::settle_model_reservation_tx(&mut tx, &invocation_id, true)
+            .await
+            .map_err(|_| denied())?;
+        tx.commit().await.map_err(|_| denied())?;
+        return Err(denied());
+    }
+    // Linearization: first synchronous transport poll while SQLite excludes disable/revoke.
+    // No permit escapes. Release the fence before awaiting DNS/connect/HTTP/response.
+    // Requests already handed to transport may reach the remote after disable commits.
+    let future = provider.complete(request, token, Duration::from_secs(30), cancel.clone());
+    tokio::pin!(future);
+    let first = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(future.as_mut(), cx))
+    })
+    .await;
+    tx.rollback().await.map_err(|_| denied())?;
+    let result = match first {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => future.await,
+    }
+    .map_err(safe_provider_error)
+    .map(|mut response| {
+        response.request_id = None;
+        response
+    });
     if *cancel.borrow() && result.is_ok() {
         return Err(denied());
     }

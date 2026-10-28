@@ -16,18 +16,22 @@ use tower::ServiceExt;
 
 const TEST_TOKEN: &str = "test-token-123456";
 
-async fn setup_app() -> axum::Router {
+async fn setup_app() -> (axum::Router, ApplicationContext, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("test_api.db");
     let db_url = format!("sqlite://{}", db_path.to_str().unwrap());
 
     let app_ctx = ApplicationContext::init(&db_url).await.unwrap();
-    router_with_app(Arc::<str>::from(TEST_TOKEN), Some(app_ctx))
+    (
+        router_with_app(Arc::<str>::from(TEST_TOKEN), Some(app_ctx.clone())),
+        app_ctx,
+        temp_dir,
+    )
 }
 
 #[tokio::test]
 async fn test_m3_all_routes_and_isolation_matrices() {
-    let app = setup_app().await;
+    let (app, ctx, _dir) = setup_app().await;
 
     // 1. Create company A and company B
     let co_a = serde_json::json!({"name": "Company A"});
@@ -55,6 +59,21 @@ async fn test_m3_all_routes_and_isolation_matrices() {
     let body_co_b = res_co_b.into_body().collect().await.unwrap().to_bytes();
     let co_b_json: serde_json::Value = serde_json::from_slice(&body_co_b).unwrap();
     let company_b = co_b_json["id"].as_str().unwrap();
+
+    ctx.ensure_canonical_permissions("0191e4b8-0002-7000-8000-000000000001")
+        .await
+        .unwrap();
+    for company in [company_a, company_b] {
+        sqlx::query("UPDATE companies SET status='ACTIVE' WHERE id=?")
+            .bind(company)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
+        for permission in ["project.modify", "project.allocate_agent"] {
+            sqlx::query("INSERT INTO permission_grants(id,workspace_id,company_id,permission_definition_id,principal_type,principal_id,scope_type,scope_id,effect,created_at) VALUES(?,'0191e4b8-0002-7000-8000-000000000001',?,?,'USER','0191e4b8-0001-7000-8000-000000000001','COMPANY',?,'ALLOW','t')")
+                .bind(format!("{company}-{permission}")).bind(company).bind(format!("pd_{permission}")).bind(company).execute(&ctx.pool).await.unwrap();
+        }
+    }
 
     // Seed department, role, agent for Company A
     let dept_req = Request::builder()

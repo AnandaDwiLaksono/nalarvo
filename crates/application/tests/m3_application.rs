@@ -31,6 +31,18 @@ async fn app() -> (ApplicationContext, CompanyId) {
             .await
             .unwrap();
     }
+    sqlx::query("UPDATE companies SET status='ACTIVE' WHERE id=?")
+        .bind(&company_id.0)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    app.ensure_canonical_permissions("0191e4b8-0002-7000-8000-000000000001")
+        .await
+        .unwrap();
+    for permission in ["project.modify", "project.allocate_agent"] {
+        sqlx::query("INSERT INTO permission_grants(id,workspace_id,company_id,permission_definition_id,principal_type,principal_id,scope_type,scope_id,effect,created_at) VALUES(?,'0191e4b8-0002-7000-8000-000000000001',?,?,'USER','0191e4b8-0001-7000-8000-000000000001','COMPANY',?,'ALLOW','t')")
+            .bind(permission).bind(&company_id.0).bind(format!("pd_{permission}")).bind(&company_id.0).execute(&app.pool).await.unwrap();
+    }
     (app, company_id)
 }
 
@@ -288,7 +300,7 @@ async fn completion_releases_assignments_before_allocations_then_disbands_teams(
     app.create_work_assignment(CreateWorkAssignmentCommand::new(
         company.clone(),
         project.id.clone(),
-        work.id,
+        work.id.clone(),
         "a1",
         allocation.id,
         true,
@@ -299,6 +311,28 @@ async fn completion_releases_assignments_before_allocations_then_disbands_teams(
         .activate_project(&company, &project.id, project.row_version)
         .await
         .unwrap();
+    assert!(
+        app.complete_project(&company, &project.id, active.row_version)
+            .await
+            .is_err()
+    );
+    let mut current = work;
+    for status in [
+        nalarvo_domain::WorkItemStatus::Ready,
+        nalarvo_domain::WorkItemStatus::InProgress,
+        nalarvo_domain::WorkItemStatus::Completed,
+    ] {
+        current = app
+            .transition_work_item(
+                &company,
+                &project.id,
+                &current.id,
+                status,
+                current.row_version,
+            )
+            .await
+            .unwrap();
+    }
     assert_eq!(
         app.complete_project(&company, &project.id, active.row_version)
             .await

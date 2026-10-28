@@ -78,7 +78,7 @@ async fn m5_upgrade_fresh_equivalence_preserves_every_historical_checksum() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(added, vec![15, 16, 17]);
+    assert_eq!(added, vec![15, 16, 17, 18, 19]);
     let fk: Vec<sqlx::sqlite::SqliteRow> = sqlx::query("PRAGMA foreign_key_check")
         .fetch_all(&pool)
         .await

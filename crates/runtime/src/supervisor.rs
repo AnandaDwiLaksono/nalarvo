@@ -470,6 +470,17 @@ async fn run_job_execution(
         (None, running)
     };
 
+    let configured:i64=sqlx::query_scalar("SELECT COUNT(*) FROM work_requirements WHERE company_id=? AND project_id=? AND work_item_id=?").bind(&company_id.0).bind(&run_running.project_id).bind(&run_running.work_item_id).fetch_one(&pool).await.map_err(|e|e.to_string())?;
+    if configured != 0 {
+        let app = nalarvo_application::ApplicationContext::new(pool.clone());
+        app.begin_scheduled_work(
+            &company_id.0,
+            &run_running.project_id,
+            &run_running.work_item_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     let context_input = crate::context::ContextInput {
         company_id: company_id.0.clone(),
         project_id: run_running.project_id.clone(),

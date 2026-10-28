@@ -31,6 +31,19 @@ struct DesktopWorkspace {
     lifecycle_state: String,
 }
 
+#[tauri::command]
+async fn core_orchestrate_project(
+    daemon_url: tauri::State<'_, String>,
+    token: tauri::State<'_, String>,
+    company_id: String,
+    project_id: String,
+    request: nalarvo_contracts::m7::OrchestrationRequest,
+) -> Result<nalarvo_contracts::m7::OrchestrationResponse, String> {
+    nalarvo_client::m7::orchestrate(&daemon_url, &token, &company_id, &project_id, &request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Serialize)]
 struct DesktopProvider {
     id: String,
@@ -1234,6 +1247,7 @@ pub fn run() {
             core_list_approvals,
             core_decide_approval,
             core_list_artifacts,
+            core_orchestrate_project,
             core_artifact_versions,
             core_list_knowledge,
             core_search_information,

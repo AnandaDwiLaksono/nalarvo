@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 pub mod m6;
+pub mod m7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {

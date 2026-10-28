@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use nalarvo_contracts::*;
-use nalarvo_domain::{CompanyId, PrincipalRef, RunStatus};
+use nalarvo_domain::CompanyId;
 use nalarvo_persistence as persistence;
 use tokio_stream::StreamExt;
 
@@ -62,32 +62,20 @@ async fn create_run(
         Some(ctx) => ctx,
         None => return service_unavailable(),
     };
-    let meta = m3_meta(&headers);
-    let principal = meta
-        .principal
-        .unwrap_or_else(|| PrincipalRef::user("0191e4b8-0001-7000-8000-000000000001"));
-    let correlation_id = meta
-        .correlation_id
-        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-
-    let mut run = match nalarvo_domain::Run::create(
-        CompanyId(company_id.clone()),
+    let cmd = nalarvo_application::m4::CreateRunCommand {
+        company_id: CompanyId(company_id),
         project_id,
-        req.work_item_id,
-        req.executing_agent_id,
-        req.trigger_type,
-        principal,
-        correlation_id,
-    ) {
-        Ok(r) => r,
-        Err(e) => return map_app_error(e.into()),
+        work_item_id: req.work_item_id,
+        executing_agent_id: req.executing_agent_id,
+        trigger_type: req.trigger_type,
+        assignment_id: req.assignment_id,
+        retry_of_run_id: req.retry_of_run_id,
+        model_profile_version_id: None,
+        meta: m3_meta(&headers),
     };
-    run.assignment_id = req.assignment_id;
-    run.retry_of_run_id = req.retry_of_run_id;
-
-    match persistence::m4::create_run(&app_ctx.pool, &run).await {
-        Ok(()) => (StatusCode::CREATED, Json(map_run(run))).into_response(),
-        Err(e) => map_app_error(e.into()),
+    match app_ctx.create_run(cmd).await {
+        Ok(run) => (StatusCode::CREATED, Json(map_run(run))).into_response(),
+        Err(e) => map_app_error(e),
     }
 }
 
@@ -127,78 +115,24 @@ async fn get_run(
 
 async fn queue_run(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path((company_id, project_id, run_id)): Path<(String, String, String)>,
     Json(req): Json<QueueRunRequest>,
 ) -> Response {
-    let app_ctx = match state.app_ctx.as_ref() {
-        Some(ctx) => ctx,
-        None => return service_unavailable(),
+    let Some(app_ctx) = state.app_ctx.as_ref() else {
+        return service_unavailable();
     };
-    let run = match persistence::m4::get_run(&app_ctx.pool, &CompanyId(company_id.clone()), &run_id)
+    match app_ctx
+        .queue_run(
+            &CompanyId(company_id),
+            &project_id,
+            &run_id,
+            req.expected_version,
+            Some(m3_meta(&headers)),
+        )
         .await
     {
-        Ok(Some(r)) if r.project_id == project_id => r,
-        Ok(_) => return map_app_error(nalarvo_application::ApplicationError::NotFound(run_id)),
-        Err(e) => return map_app_error(e.into()),
-    };
-
-    let payload = match serde_json::to_value(&nalarvo_contracts::WorkerExecutionRequest {
-        run_id: run.id.clone(),
-        company_id: run.company_id.0.clone(),
-        project_id: run.project_id.clone(),
-        work_item_id: run.work_item_id.clone(),
-        executing_agent_id: run.executing_agent_id.clone(),
-        model_profile_version_id: run.model_profile_version_id.clone(),
-        correlation_id: run.correlation_id.clone(),
-    }) {
-        Ok(v) => v,
-        Err(e) => {
-            return map_app_error(nalarvo_domain::DomainError::Validation(e.to_string()).into());
-        }
-    };
-
-    let job = persistence::m4::DurableJob {
-        id: uuid::Uuid::now_v7().to_string(),
-        job_type: "EXECUTE_RUN".into(),
-        company_id: run.company_id.clone(),
-        run_id: run.id.clone(),
-        payload,
-        available_at: chrono::Utc::now(),
-        priority: 0,
-        attempt: 0,
-        max_attempts: 3,
-        correlation_id: run.correlation_id.clone(),
-    };
-
-    let event = nalarvo_domain::DomainEvent {
-        event_id: uuid::Uuid::now_v7().to_string(),
-        event_type: "RunQueued".into(),
-        schema_version: 1,
-        company_id: run.company_id.clone(),
-        aggregate_type: "Run".into(),
-        aggregate_id: run.id.clone(),
-        aggregate_version: req.expected_version + 1,
-        occurred_at: chrono::Utc::now(),
-        correlation_id: run.correlation_id.clone(),
-        causation_id: run
-            .causation_id
-            .unwrap_or_else(|| run.correlation_id.clone()),
-        principal: run.requested_by,
-        scope: nalarvo_domain::ScopeRef::company(&run.company_id.0),
-        payload: serde_json::json!({ "lifecycle_state": "QUEUED" }),
-    };
-
-    match persistence::m4::queue_run(
-        &app_ctx.pool,
-        &CompanyId(company_id),
-        &run_id,
-        req.expected_version,
-        &job,
-        &event,
-    )
-    .await
-    {
-        Ok(()) => (
+        Ok(_) => (
             StatusCode::ACCEPTED,
             Json(CommandAcceptedResponse {
                 run_id,
@@ -207,7 +141,7 @@ async fn queue_run(
             }),
         )
             .into_response(),
-        Err(e) => map_app_error(e.into()),
+        Err(e) => map_app_error(e),
     }
 }
 
@@ -216,26 +150,18 @@ async fn cancel_run(
     Path((company_id, project_id, run_id)): Path<(String, String, String)>,
     Json(req): Json<CancelRunRequest>,
 ) -> Response {
-    let app_ctx = match state.app_ctx.as_ref() {
-        Some(ctx) => ctx,
-        None => return service_unavailable(),
+    let Some(app_ctx) = state.app_ctx.as_ref() else {
+        return service_unavailable();
     };
-    match persistence::m4::get_run(&app_ctx.pool, &CompanyId(company_id.clone()), &run_id).await {
-        Ok(Some(r)) if r.project_id == project_id => r,
-        Ok(_) => return map_app_error(nalarvo_application::ApplicationError::NotFound(run_id)),
-        Err(e) => return map_app_error(e.into()),
-    };
-
-    match persistence::m4::transition_run(
-        &app_ctx.pool,
-        &CompanyId(company_id),
-        &run_id,
-        req.expected_version,
-        RunStatus::Cancelled,
-        None,
-        req.reason.as_deref(),
-    )
-    .await
+    match app_ctx
+        .cancel_run(
+            &CompanyId(company_id),
+            &project_id,
+            &run_id,
+            req.expected_version,
+            req.reason,
+        )
+        .await
     {
         Ok(_) => (
             StatusCode::ACCEPTED,
@@ -246,7 +172,7 @@ async fn cancel_run(
             }),
         )
             .into_response(),
-        Err(e) => map_app_error(e.into()),
+        Err(e) => map_app_error(e),
     }
 }
 

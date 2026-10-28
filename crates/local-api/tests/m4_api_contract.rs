@@ -102,6 +102,19 @@ async fn setup_app() -> TestSetup {
     let p_json: serde_json::Value =
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let project_id = p_json["id"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE companies SET status='ACTIVE' WHERE id=?")
+        .bind(&company_id)
+        .execute(&app_ctx.pool)
+        .await
+        .unwrap();
+    app_ctx
+        .ensure_canonical_permissions("0191e4b8-0002-7000-8000-000000000001")
+        .await
+        .unwrap();
+    for permission in ["project.modify", "project.allocate_agent"] {
+        sqlx::query("INSERT INTO permission_grants(id,workspace_id,company_id,permission_definition_id,principal_type,principal_id,scope_type,scope_id,effect,created_at) VALUES(?,'0191e4b8-0002-7000-8000-000000000001',?,?,'USER','0191e4b8-0001-7000-8000-000000000001','COMPANY',?,'ALLOW','t')")
+            .bind(permission).bind(&company_id).bind(format!("pd_{permission}")).bind(&company_id).execute(&app_ctx.pool).await.unwrap();
+    }
 
     // 4. Create work item
     let req = Request::builder()
@@ -126,6 +139,51 @@ async fn setup_app() -> TestSetup {
     let w_json: serde_json::Value =
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let work_item_id = w_json["id"].as_str().unwrap().to_string();
+
+    // Run HTTP commands now use application admission, including active scope.
+    sqlx::query("UPDATE companies SET status='ACTIVE' WHERE id=?")
+        .bind(&company_id)
+        .execute(&app_ctx.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE projects SET status='ACTIVE' WHERE id=?")
+        .bind(&project_id)
+        .execute(&app_ctx.pool)
+        .await
+        .unwrap();
+    let team = app_ctx
+        .create_team(nalarvo_application::CreateTeamCommand::new(
+            nalarvo_domain::CompanyId(company_id.clone()),
+            project_id.clone(),
+            "Execution team",
+        ))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE teams SET status='ACTIVE' WHERE id=?")
+        .bind(&team.id)
+        .execute(&app_ctx.pool)
+        .await
+        .unwrap();
+    let allocation = app_ctx
+        .create_agent_allocation(nalarvo_application::CreateAgentAllocationCommand::new(
+            nalarvo_domain::CompanyId(company_id.clone()),
+            project_id.clone(),
+            team.id,
+            agent_id.clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+    app_ctx
+        .transition_agent_allocation(
+            &nalarvo_domain::CompanyId(company_id.clone()),
+            &project_id,
+            &allocation.id,
+            nalarvo_domain::AgentAllocationStatus::Active,
+            allocation.row_version,
+        )
+        .await
+        .unwrap();
 
     TestSetup {
         app,

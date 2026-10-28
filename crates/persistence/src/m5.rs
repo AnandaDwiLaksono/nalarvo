@@ -256,6 +256,20 @@ pub async fn release_model_reservation(
     invocation: &str,
 ) -> Result<(), PersistenceError> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let dispatch: Option<String> =
+        sqlx::query_scalar("SELECT status FROM model_dispatches WHERE id=?")
+            .bind(invocation)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(state) = dispatch {
+        if state != "PREPARED" {
+            return Err(nalarvo_domain::DomainError::Validation(
+                "Dispatched model cannot be blindly released".into(),
+            )
+            .into());
+        }
+        crate::model_dispatch::transition_tx(&mut tx, invocation, "PREPARED", "ABORTED").await?;
+    }
     settle_model_reservation_tx(&mut tx, invocation, true).await?;
     tx.commit().await?;
     Ok(())
