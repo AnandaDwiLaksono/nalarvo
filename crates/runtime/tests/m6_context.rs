@@ -9,7 +9,7 @@ use nalarvo_model_gateway::{ModelMessage, ModelRequest};
 use nalarvo_runtime::{core_dispatch::TrustedRunContext, core_model};
 use sqlx::Row;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::watch;
 struct Store(Arc<Mutex<String>>, Arc<AtomicUsize>);
 #[derive(Clone)]
@@ -37,6 +37,35 @@ impl tracing::Subscriber for CapturedLogs {
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+async fn capture_logs() -> (tokio::sync::MutexGuard<'static, ()>, CapturedLogs) {
+    static LOGS: OnceLock<CapturedLogs> = OnceLock::new();
+    static CAPTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // ponytail: isolate this binary's fixtures; use per-fixture routing if parallelism matters.
+    let guard = tokio::time::timeout(std::time::Duration::from_secs(30), CAPTURE.lock())
+        .await
+        .expect("previous tracing capture did not finish");
+    let logs = LOGS.get_or_init(|| {
+        let logs = CapturedLogs(Arc::new(Mutex::new(String::new())));
+        tracing::subscriber::set_global_default(logs.clone()).unwrap();
+        logs
+    });
+    logs.0.lock().unwrap().clear();
+    (guard, logs.clone())
+}
+#[tokio::test]
+async fn tracing_capture_observes_cross_thread_callsites() {
+    let (_guard, logs) = capture_logs().await;
+    assert!(logs.0.lock().unwrap().is_empty());
+    std::thread::spawn(|| tracing::info!("cross-thread capture regression"))
+        .join()
+        .unwrap();
+    assert!(
+        logs.0
+            .lock()
+            .unwrap()
+            .contains("cross-thread capture regression")
+    );
 }
 fn contains_credential(text: &str, credential: &str) -> bool {
     fn contains(value: &serde_json::Value, credential: &str) -> bool {
@@ -76,8 +105,7 @@ async fn production_provider_metadata_is_not_retained() {
     context_fixture(false, true).await;
 }
 async fn context_fixture(credential_regressions: bool, metadata_regressions: bool) {
-    let logs = CapturedLogs(Arc::new(Mutex::new(String::new())));
-    let _log_guard = metadata_regressions.then(|| tracing::subscriber::set_default(logs.clone()));
+    let (_log_guard, logs) = capture_logs().await;
     let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let cap = captured.clone();
     let headers = Arc::new(Mutex::new(Vec::new()));
@@ -486,13 +514,17 @@ async fn context_fixture(credential_regressions: bool, metadata_regressions: boo
             "corr"
         );
         // Nonempty capture proves real tracing was observed, not just an empty file scan.
-        let logs = logs.0.lock().unwrap();
-        assert!(!logs.is_empty());
-        assert!(!contains_credential(&logs, canary));
-        for transformed in &ids[..6] {
-            assert!(!logs.contains(transformed));
+        {
+            let logs = logs.0.lock().unwrap();
+            assert!(!logs.is_empty());
+            assert!(!contains_credential(&logs, canary));
+            for transformed in &ids[..6] {
+                assert!(!logs.contains(transformed));
+            }
         }
         server.abort();
+        let _ = server.await;
+        pool.close().await;
         return;
     }
     if credential_regressions {
@@ -708,6 +740,8 @@ async fn context_fixture(credential_regressions: bool, metadata_regressions: boo
         assert_eq!(headers.lock().unwrap()[1], "Bearer synthetic\"\\token");
         assert_eq!(app.context_snapshots("c", "run").await.unwrap().len(), 2);
         server.abort();
+        let _ = server.await;
+        pool.close().await;
         return;
     }
     let mut reflected = input;
@@ -766,4 +800,6 @@ async fn context_fixture(credential_regressions: bool, metadata_regressions: boo
             .is_empty()
     );
     server.abort();
+    let _ = server.await;
+    restarted.pool.close().await;
 }
